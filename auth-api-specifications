@@ -1,0 +1,509 @@
+
+● /auth/* Endpoints Overzicht
+
+  Volledig overzicht van alle standaard authenticatie endpoints (zonder OAuth).
+
+  ---
+  📋 Registratie & Verificatie
+
+  POST /auth/register
+
+  Beschrijving: Registreer een nieuwe gebruiker met email + wachtwoord
+
+  Rate Limit: 3/hour (via Redis)
+
+  Request Body:
+  {
+    "email": "user@example.com",
+    "password": "SecurePass123!"
+  }
+
+  Validatie:
+  - Email: Geldige email (wordt lowercase)
+  - Password: Min 8 karakters, max 128 karakters
+  - Password strength: zxcvbn score 3-4 vereist
+  - Breach check: HIBP database controle (613M+ breached passwords)
+
+  Response (201 Created):
+  {
+    "message": "Registration successful. Please check your email to verify your account.",
+    "email": "user@example.com",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Flow:
+  1. Valideer wachtwoord sterkte (zxcvbn + HIBP)
+  2. Hash wachtwoord met Argon2id
+  3. Maak user aan via sp_create_user() (is_verified=FALSE)
+  4. Genereer verification token + 6-digit code
+  5. Sla op in Redis (verify_token:{token}, verify_user:{user_id})
+  6. Verstuur verification email met code
+  7. Return 201 (GEEN tokens - user moet eerst email verifiëren)
+
+  Implementatie: app/routes/register.py:11 → RegistrationService.register_user()
+
+  ---
+  POST /auth/verify-code
+
+  Beschrijving: Verifieer email met token + 6-digit code
+
+  Rate Limit: 10/minute
+
+  Request Body:
+  {
+    "verification_token": "550e8400e29b41d4a716446655440000",
+    "code": "123456"
+  }
+
+  Response (200 OK):
+  {
+    "message": "Email verified successfully. You can now log in."
+  }
+
+  Flow:
+  1. Lookup token in Redis (verify_token:{token})
+  2. Valideer 6-digit code
+  3. Mark user as verified via sp_verify_user_email(user_id)
+  4. Verwijder verification tokens uit Redis
+  5. Return success message
+
+  Implementatie: app/routes/verify.py:11 → RegistrationService.verify_account_by_code()
+
+  ---
+  🔐 Login & Token Management
+
+  POST /auth/login
+
+  Beschrijving: Login met email + password (+ optioneel verification code + org_id)
+
+  Rate Limit: 5/minute
+
+  Request Body (Step 1 - Initial login):
+  {
+    "email": "user@example.com",
+    "password": "SecurePass123!"
+  }
+
+  Response (200 OK - Code sent):
+  {
+    "message": "Verification code sent to your email",
+    "email": "user@example.com",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "expires_in": 600,
+    "requires_code": true
+  }
+
+  Request Body (Step 2 - With verification code):
+  {
+    "email": "user@example.com",
+    "password": "SecurePass123!",
+    "code": "123456"
+  }
+
+  Response (Single org - Auto-select):
+  {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "org_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Response (Multiple orgs - Selection required):
+  {
+    "message": "Please select an organization",
+    "organizations": [
+      {
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "name": "Acme Corp",
+        "slug": "acme-corp",
+        "role": "admin",
+        "member_count": 15
+      },
+      {
+        "id": "660e8400-e29b-41d4-a716-446655440000",
+        "name": "Tech Startup",
+        "slug": "tech-startup",
+        "role": "member",
+        "member_count": 5
+      }
+    ],
+    "user_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "expires_in": 900
+  }
+
+  Request Body (Step 3 - With org selection):
+  {
+    "email": "user@example.com",
+    "password": "SecurePass123!",
+    "code": "123456",
+    "org_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Response (Org-scoped tokens):
+  {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "org_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Flow:
+  1. No code: Verstuur 6-digit code naar email → return LoginCodeSentResponse
+  2. Code + single org: Auto-select org → return org-scoped tokens
+  3. Code + multiple orgs (no org_id): Return org list + temporary user token
+  4. Code + org_id: Return org-scoped tokens
+
+  Validaties:
+  - Email bestaat en is geverifieerd (is_verified=TRUE)
+  - Wachtwoord correct (Argon2id verify)
+  - Account actief (is_active=TRUE)
+
+  Tokens:
+  - Access token: 15 minuten, JWT met HS256
+  - Refresh token: 30 dagen, single-use met JTI
+  - Org-scoped: Bevat org_id claim
+
+  Implementatie: app/routes/login.py:19 → AuthService.login_user()
+
+  ---
+  POST /auth/login/2fa
+
+  Beschrijving: Login met 2FA/TOTP code (legacy - voor backwards compatibility)
+
+  Rate Limit: 10/minute
+
+  Request Body:
+  {
+    "pre_auth_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "code": "123456"
+  }
+
+  Response:
+  {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer"
+  }
+
+  Implementatie: app/routes/login.py:58 → AuthService.login_2fa_challenge()
+
+  ---
+  POST /auth/refresh
+
+  Beschrijving: Refresh access token (token rotation - old refresh token wordt blacklisted)
+
+  Rate Limit: Geen
+
+  Request Body:
+  {
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }
+
+  Response:
+  {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "org_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Flow:
+  1. Valideer refresh token (JWT signature + expiry)
+  2. Check JTI niet in blacklist (blacklist_jti:{jti})
+  3. Genereer nieuwe access + refresh tokens
+  4. Blacklist oude refresh token JTI (TTL: 30 dagen)
+  5. Return nieuwe tokens
+
+  Security:
+  - Single-use tokens (oude refresh token direct blacklisted)
+  - JTI tracking in Redis
+  - Prevents token replay attacks
+
+  Implementatie: app/routes/refresh.py:9 → TokenService.refresh_access_token()
+
+  ---
+  POST /auth/logout
+
+  Beschrijving: Logout gebruiker (blacklist refresh token)
+
+  Rate Limit: Geen
+
+  Request Body:
+  {
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }
+
+  Response:
+  {
+    "message": "Logged out successfully"
+  }
+
+  Flow:
+  1. Decode refresh token
+  2. Blacklist JTI in Redis (blacklist_jti:{jti}, TTL: 30 dagen)
+  3. Return success message
+
+  Note: Access tokens blijven geldig tot expiry (15 min) - stateless design
+
+  Implementatie: app/routes/logout.py:9 → AuthService.logout_user()
+
+  ---
+  🔑 Password Management
+
+  POST /auth/request-password-reset
+
+  Beschrijving: Vraag password reset aan (verstuur reset email)
+
+  Rate Limit: 1/5min
+
+  Request Body:
+  {
+    "email": "user@example.com"
+  }
+
+  Response (200 OK):
+  {
+    "message": "If an account with that email exists, we've sent password reset instructions.",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+
+  Flow:
+  1. Lookup user by email (silent fail if not exists - no enumeration)
+  2. Genereer reset token + 6-digit code
+  3. Sla op in Redis (reset_token:{token}, reset_user:{user_id}, TTL: 1 uur)
+  4. Verstuur password reset email met code
+  5. Return generic success message
+
+  Security:
+  - Generic response (no user enumeration)
+  - Short TTL (1 hour)
+  - Rate limited (1 request per 5 minutes)
+
+  Implementatie: app/routes/password_reset.py:11 → PasswordResetService.request_password_reset()
+
+  ---
+  POST /auth/reset-password
+
+  Beschrijving: Reset password met token + code + nieuw wachtwoord
+
+  Rate Limit: 1/5min
+
+  Request Body:
+  {
+    "reset_token": "550e8400e29b41d4a716446655440000",
+    "code": "123456",
+    "new_password": "NewSecurePass456!"
+  }
+
+  Response (200 OK):
+  {
+    "message": "Password reset successfully. You can now log in with your new password."
+  }
+
+  Flow:
+  1. Lookup token in Redis (reset_token:{token})
+  2. Valideer 6-digit code
+  3. Valideer nieuwe wachtwoord (zxcvbn + HIBP)
+  4. Hash nieuwe wachtwoord met Argon2id
+  5. Update password via sp_update_password(user_id, hashed_password)
+  6. Verwijder reset tokens uit Redis
+  7. Return success message
+
+  Implementatie: app/routes/password_reset.py:23 → PasswordResetService.confirm_password_reset()
+
+  ---
+  🔒 Two-Factor Authentication (2FA/TOTP)
+
+  Vereiste: Access token in Authorization: Bearer <token> header
+
+  POST /auth/2fa/setup
+
+  Beschrijving: Setup 2FA - genereer TOTP secret + QR code
+
+  Auth: Access token required
+
+  Request Body: Geen (empty)
+
+  Response:
+  {
+    "secret": "JBSWY3DPEHPK3PXP",
+    "qr_code": "otpauth://totp/ActivityApp:user@example.com?secret=JBSWY3DPEHPK3PXP&issuer=ActivityApp",
+    "backup_codes": ["12345678", "87654321", ...]
+  }
+
+  Flow:
+  1. Genereer TOTP secret (pyotp)
+  2. Encrypt secret (Fernet encryption met ENCRYPTION_KEY)
+  3. Genereer 10 backup codes
+  4. Sla encrypted secret op in database (nog niet actief)
+  5. Return secret, QR code URI, backup codes
+
+  Implementatie: app/routes/twofa.py:20 → TwoFactorService.setup_2fa()
+
+  ---
+  POST /auth/2fa/verify
+
+  Beschrijving: Verifieer 2FA setup + enable 2FA
+
+  Auth: Access token required
+
+  Request Body:
+  {
+    "code": "123456"
+  }
+
+  Response:
+  {
+    "message": "2FA enabled successfully"
+  }
+
+  Flow:
+  1. Get encrypted TOTP secret from database
+  2. Decrypt secret
+  3. Verify TOTP code (pyotp)
+  4. Mark 2FA as enabled (is_2fa_enabled=TRUE)
+  5. Return success message
+
+  Implementatie: app/routes/twofa.py:31 → TwoFactorService.verify_and_enable_2fa()
+
+  ---
+  POST /auth/2fa/disable
+
+  Beschrijving: Disable 2FA voor gebruiker
+
+  Auth: Access token required
+
+  Request Body: Geen (empty)
+
+  Response:
+  {
+    "message": "2FA disabled successfully"
+  }
+
+  Flow:
+  1. Mark 2FA as disabled (is_2fa_enabled=FALSE)
+  2. Delete encrypted TOTP secret
+  3. Return success message
+
+  Implementatie: app/routes/twofa.py:43 → TwoFactorService.disable_2fa()
+
+  ---
+  🔧 Token Structure
+
+  Access Token (JWT)
+
+  {
+    "sub": "550e8400-e29b-41d4-a716-446655440000",  // user_id
+    "email": "user@example.com",
+    "org_id": "660e8400-e29b-41d4-a716-446655440000", // optional
+    "exp": 1704067200,  // 15 minuten
+    "iat": 1704066300,
+    "type": "access"
+  }
+
+  Refresh Token (JWT)
+
+  {
+    "sub": "550e8400-e29b-41d4-a716-446655440000",  // user_id
+    "jti": "unique-token-id",  // Voor blacklisting
+    "org_id": "660e8400-e29b-41d4-a716-446655440000", // optional
+    "exp": 1706658300,  // 30 dagen
+    "iat": 1704066300,
+    "type": "refresh"
+  }
+
+  ---
+  ⚠️ Error Responses
+
+  Validation Errors (422 Unprocessable Entity)
+
+  {
+    "detail": [
+      {
+        "loc": ["body", "email"],
+        "msg": "value is not a valid email address",
+        "type": "value_error.email"
+      }
+    ]
+  }
+
+  Authentication Errors (401 Unauthorized)
+
+  {
+    "detail": "Invalid credentials"
+  }
+
+  Rate Limit Errors (429 Too Many Requests)
+
+  {
+    "error": "Rate limit exceeded",
+    "retry_after": 300
+  }
+
+  Generic Errors (400 Bad Request)
+
+  {
+    "detail": "Email not verified. Please check your inbox for verification instructions."
+  }
+
+  ---
+  📊 Rate Limits Overzicht
+
+  | Endpoint                     | Rate Limit | Redis Key Pattern        |
+  |------------------------------|------------|--------------------------|
+  | /auth/register               | 3/hour     | slowapi:register:*       |
+  | /auth/login                  | 5/minute   | slowapi:login:*          |
+  | /auth/verify-code            | 10/minute  | slowapi:verify:*         |
+  | /auth/request-password-reset | 1/5min     | slowapi:password-reset:* |
+  | /auth/reset-password         | 1/5min     | slowapi:password-reset:* |
+  | /auth/login/2fa              | 10/minute  | slowapi:login-2fa:*      |
+
+  ---
+  🔐 Security Features
+
+  1. Hard Email Verification: MUST verify email before login
+  2. Password Security:
+    - Argon2id hashing (PHC winner, GPU-resistant)
+    - zxcvbn strength scoring (score 3-4)
+    - HIBP breach checking (613M+ passwords)
+  3. Token Security:
+    - JWT with HS256
+    - Single-use refresh tokens (JTI blacklisting)
+    - Short-lived access tokens (15 min)
+  4. Rate Limiting: Brute-force protection
+  5. No User Enumeration: Generic error messages
+  6. 2FA/TOTP: Optional second factor
+  7. Organization Support: Multi-tenant token scoping
+
+  ---
+  🧪 Test Examples
+
+  # Full registration + login flow
+  curl -X POST http://localhost:8000/auth/register \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@example.com","password":"SecurePass123!"}'
+
+  # Verify email (check inbox for code)
+  curl -X POST http://localhost:8000/auth/verify-code \
+    -H "Content-Type: application/json" \
+    -d '{"verification_token":"xxx","code":"123456"}'
+
+  # Login (step 1 - request code)
+  curl -X POST http://localhost:8000/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@example.com","password":"SecurePass123!"}'
+
+  # Login (step 2 - with code)
+  curl -X POST http://localhost:8000/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@example.com","password":"SecurePass123!","code":"123456"}'
+
+  # Refresh tokens
+  curl -X POST http://localhost:8000/auth/refresh \
+    -H "Content-Type: application/json" \
+    -d '{"refresh_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}'
+
+  # Logout
+  curl -X POST http://localhost:8000/auth/logout \
+    -H "Content-Type: application/json" \
+    -d '{"refresh_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."}'
