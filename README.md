@@ -372,3 +372,109 @@ For issues and questions:
 ## Credits
 
 Built with FastAPI, PostgreSQL, and Redis.
+
+---
+
+## Production Checklist
+
+Before deploying to production, ensure you complete these critical steps:
+
+### ⚠️ CRITICAL - Security Configuration
+
+1. **CORS Configuration** - Currently set to `allow_origins=["*"]`
+   ```python
+   # In app/main.py, change:
+   app.add_middleware(
+       CORSMiddleware,
+       allow_origins=["https://your-frontend.com"],  # Specify your actual domains
+       allow_credentials=True,
+       allow_methods=["GET", "POST", "PATCH"],
+       allow_headers=["Authorization", "Content-Type"],
+   )
+   ```
+
+2. **JWT Secret** - Use strong, unique secret
+   ```bash
+   # Generate strong secret:
+   openssl rand -hex 32
+   # Add to .env:
+   JWT_SECRET_KEY=<generated-secret>
+   ```
+
+3. **Database Credentials** - Use secure credentials
+   ```bash
+   # Never use default passwords in production!
+   DATABASE_URL=postgresql://secure_user:strong_password@db:5432/activities_db
+   ```
+
+4. **Redis Password** - Enable Redis authentication
+   ```bash
+   REDIS_URL=redis://:strong_password@redis:6379/0
+   ```
+
+### ✅ Configuration Checklist
+
+- [ ] Change `ENVIRONMENT=production` in .env
+- [ ] Set `DEBUG=false` in .env
+- [ ] Configure CORS with specific origins
+- [ ] Set strong JWT_SECRET_KEY
+- [ ] Use secure database credentials
+- [ ] Enable Redis authentication
+- [ ] Configure EMAIL_API_URL with production URL
+- [ ] Set LOG_LEVEL=INFO or WARNING
+- [ ] Review rate limits for your use case
+- [ ] Set up SSL/TLS certificates
+- [ ] Configure firewall rules
+- [ ] Set up monitoring and alerting
+- [ ] Create database backups
+- [ ] Test all endpoints with production data
+
+### 🔍 Pre-Deployment Testing
+
+1. **Load Testing**
+   ```bash
+   # Test rate limiting
+   ab -n 1000 -c 10 http://localhost:8000/health
+   ```
+
+2. **Security Scanning**
+   ```bash
+   # Install safety
+   pip install safety
+   # Check for vulnerabilities
+   safety check -r requirements.txt
+   ```
+
+3. **Database Migration**
+   ```bash
+   # Test stored procedures
+   psql $DATABASE_URL -f migrations/001_moderation_stored_procedures.sql
+   ```
+
+4. **Integration Testing**
+   - Test JWT authentication with actual auth-api
+   - Test email notifications with actual email-api
+   - Test all 11 endpoints with production-like data
+
+### 📊 Monitoring Setup
+
+Recommended monitoring:
+- Application health: `/health` endpoint
+- Database connection pool status
+- Redis connection status
+- Rate limit hit rate
+- API response times
+- Error rates per endpoint
+- Email delivery success rate
+
+### 🚨 Known Production Considerations
+
+1. **Rate Limiting**: Currently configured for single-instance deployment. For multi-instance, ensure all instances share the same Redis.
+
+2. **Database Connections**: Connection pool sized for 5-20 connections. Adjust based on your load.
+
+3. **Email Failures**: Email sending is non-blocking. Failed emails are logged but don't break API responses.
+
+4. **Stored Procedures**: All 11 SPs must be deployed before starting the API.
+
+5. **JWT Validation**: Ensure JWT_SECRET_KEY exactly matches your auth-api configuration.
