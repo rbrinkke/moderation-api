@@ -1,0 +1,258 @@
+Ah, perfect! Je wilt een algemene blauwdruk die je voor *elke* nieuwe FastAPI kunt gebruiken, niet specifiek voor chat. Hier is een generieke versie:
+
+---
+
+## Algemene FastAPI Blauwdruk: Universele Best Practices
+
+### 1. Project Structuur (Voor elk type API)
+
+```
+project/
+├── app/
+│   ├── __init__.py
+│   ├── main.py              # FastAPI app instantie + startup/shutdown
+│   ├── config.py            # Centralized settings (BaseSettings)
+│   ├── routes/              # HTTP endpoints (dunne laag)
+│   │   └── __init__.py
+│   ├── services/            # Bedrijfslogica (het brein)
+│   │   └── __init__.py
+│   ├── models/              # Database modellen
+│   │   └── __init__.py
+│   ├── schemas/             # Pydantic input/output modellen
+│   │   └── __init__.py
+│   ├── core/                # Gedeelde kernlogica
+│   │   ├── logging_config.py
+│   │   ├── exceptions.py
+│   │   └── security.py
+│   ├── middleware/          # Request interceptors
+│   │   └── __init__.py
+│   └── dependencies.py      # Herbruikbare Depends()
+├── tests/
+├── .env
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+### 2. Verantwoordelijkheid per Laag
+
+**Routes** (De "Poortwachters"):
+- Alleen HTTP handling
+- Input valideren via Pydantic schemas
+- Dependencies injecteren
+- Services aanroepen
+- **GEEN** bedrijfslogica
+
+**Services** (Het "Brein"):
+- **ALLE** bedrijfslogica
+- Coördineert database, cache, externe calls
+- Kan andere services aanroepen
+- Wordt door routes gebruikt via dependency injection
+
+**Models** (Database):
+- Database schema definitie
+- Indexes en constraints
+- Geen logica (alleen datastructuur)
+
+**Schemas** (Contract):
+- API input/output definitie
+- Validatie regels
+- Type conversies
+
+### 3. Configuratie Patroon
+
+```python
+# app/config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    # Environment
+    ENVIRONMENT: str = "development"
+    DEBUG: bool = False
+    
+    # API
+    API_V1_PREFIX: str = "/api/v1"
+    PROJECT_NAME: str
+    
+    # Database
+    DATABASE_URL: str
+    
+    # Security (indien JWT gebruikt)
+    JWT_SECRET_KEY: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    
+    # Observability
+    LOG_LEVEL: str = "INFO"
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
+```
+
+### 4. Logging Setup (Altijd)
+
+```python
+# app/core/logging_config.py
+import structlog
+
+def setup_logging(environment: str):
+    processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    
+    if environment == "production":
+        processors.append(structlog.processors.JSONRenderer())
+    else:
+        processors.append(structlog.dev.ConsoleRenderer())
+    
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+```
+
+### 5. Correlation ID Middleware (Altijd)
+
+```python
+# app/middleware/correlation.py
+from starlette.middleware.base import BaseHTTPMiddleware
+import structlog
+import uuid
+
+class CorrelationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        correlation_id = request.headers.get("X-Trace-ID") or str(uuid.uuid4())
+        structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+        
+        response = await call_next(request)
+        response.headers["X-Trace-ID"] = correlation_id
+        return response
+```
+
+### 6. Exception Handling (Altijd)
+
+```python
+# app/core/exceptions.py
+from fastapi import HTTPException
+
+class AppException(HTTPException):
+    """Base voor alle custom exceptions"""
+    pass
+
+class NotFoundException(AppException):
+    def __init__(self, resource: str):
+        super().__init__(status_code=404, detail=f"{resource} not found")
+
+class ValidationException(AppException):
+    def __init__(self, message: str):
+        super().__init__(status_code=422, detail=message)
+
+# In main.py:
+@app.exception_handler(AppException)
+async def app_exception_handler(request, exc):
+    logger.error("app_exception", error=str(exc))
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+```
+
+### 7. Health Check (Altijd)
+
+```python
+# app/routes/health.py
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check():
+    # Check kritieke dependencies
+    checks = {
+        "api": "ok",
+        "database": await check_database(),
+    }
+    
+    all_ok = all(v == "ok" for v in checks.values())
+    status_code = 200 if all_ok else 503
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "ok" if all_ok else "degraded", "checks": checks}
+    )
+```
+
+### 8. Dependency Injection Patroon
+
+```python
+# app/dependencies.py
+from fastapi import Depends
+
+def get_service() -> SomeService:
+    """Factory voor service instanties"""
+    return SomeService()
+
+# In routes:
+@router.post("/resource")
+async def create_resource(
+    data: ResourceCreate,
+    service: SomeService = Depends(get_service)
+):
+    return await service.create(data)
+```
+
+### 9. Docker Setup (Altijd)
+
+```dockerfile
+FROM python:3.11-slim as builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 appuser
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY . .
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### 10. Metrics (Voor productie)
+
+```python
+# In main.py
+from prometheus_fastapi_instrumentator import Instrumentator
+
+app = FastAPI()
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+```
+
+---
+
+## Checklist voor Nieuwe API
+
+Bij elke nieuwe FastAPI:
+- ✅ Structuur volgens blauwdruk
+- ✅ Gecentraliseerde config (`config.py`)
+- ✅ Structured logging met correlation IDs
+- ✅ Exception handling
+- ✅ Health check endpoint
+- ✅ Dockerfile + docker-compose
+- ✅ Dependencies voor testbaarheid
+- ✅ `/metrics` endpoint voor monitoring
+
+Dit is je **universele startpunt**. Elke API die je maakt begint hiermee. 🎯
