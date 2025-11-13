@@ -2,6 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from app.config import settings
+from app.services.database import db
 import structlog
 
 logger = structlog.get_logger()
@@ -12,6 +13,7 @@ async def get_current_user(
 ) -> dict:
     """
     Extract and validate user from JWT token.
+    Fetches user details from database since auth-api JWTs contain minimal claims.
 
     Returns:
         dict with user_id, email, roles
@@ -32,10 +34,35 @@ async def get_current_user(
                 detail="Invalid authentication credentials"
             )
 
+        # Fetch user details from database (auth-api JWT has minimal claims)
+        user_record = await db.fetch_one(
+            "SELECT user_id, email, roles, is_verified, status FROM activity.users WHERE user_id = $1",
+            user_id
+        )
+
+        if user_record is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials"
+            )
+
+        # Check if user is verified and active
+        if not user_record["is_verified"]:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Email not verified"
+            )
+
+        if user_record["status"] != "active":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Account is {user_record['status']}"
+            )
+
         return {
-            "user_id": user_id,
-            "email": payload.get("email"),
-            "roles": payload.get("roles", [])
+            "user_id": str(user_record["user_id"]),
+            "email": user_record["email"],
+            "roles": user_record["roles"] or []
         }
     except JWTError as e:
         logger.error("jwt_validation_failed", error=str(e))

@@ -31,8 +31,8 @@ async def ban_user(
             admin["user_id"],
             user_id,
             ban_request.ban_type,
-            ban_request.ban_duration_hours,
-            ban_request.ban_reason
+            ban_request.ban_reason,
+            ban_request.ban_duration_hours
         )
 
         # Parse JSON result from stored procedure

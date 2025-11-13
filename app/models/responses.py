@@ -1,25 +1,26 @@
-from pydantic import BaseModel, UUID4
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+from uuid import UUID
 
 # Report responses
 class CreateReportResponse(BaseModel):
     success: bool
-    report_id: UUID4
+    report_id: UUID
     status: str
     created_at: datetime
 
 class ReporterInfo(BaseModel):
-    user_id: UUID4
+    user_id: UUID
     username: str
     email: str
 
 class ReportResponse(BaseModel):
-    report_id: UUID4
+    report_id: UUID
     reporter: ReporterInfo
     reported_user: Optional[ReporterInfo]
     target_type: str
-    target_id: UUID4
+    target_id: UUID
     report_type: str
     description: Optional[str]
     status: str
@@ -33,7 +34,7 @@ class GetReportsResponse(BaseModel):
 
 # Photo moderation responses
 class PendingPhoto(BaseModel):
-    user_id: UUID4
+    user_id: UUID
     username: str
     email: str
     main_photo_url: str
@@ -47,7 +48,7 @@ class GetPendingPhotosResponse(BaseModel):
 
 class ModeratePhotoResponse(BaseModel):
     success: bool
-    user_id: UUID4
+    user_id: UUID
     main_photo_url: str
     moderation_status: str
     moderated_at: datetime
@@ -55,7 +56,7 @@ class ModeratePhotoResponse(BaseModel):
 # Ban responses
 class BanUserResponse(BaseModel):
     success: bool
-    user_id: UUID4
+    user_id: UUID
     status: str
     ban_expires_at: Optional[datetime]
     ban_reason: str
@@ -63,19 +64,19 @@ class BanUserResponse(BaseModel):
 
 class UnbanUserResponse(BaseModel):
     success: bool
-    user_id: UUID4
+    user_id: UUID
     status: str
     unbanned_at: datetime
-    unbanned_by_user_id: UUID4
+    unbanned_by_user_id: UUID
 
 # Content removal response
 class RemoveContentResponse(BaseModel):
     success: bool
     content_type: str
-    content_id: UUID4
+    content_id: UUID
     status: str
     removed_at: datetime
-    removed_by_user_id: UUID4
+    removed_by_user_id: UUID
 
 # Generic response
 class SuccessResponse(BaseModel):

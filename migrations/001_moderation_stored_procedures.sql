@@ -518,7 +518,7 @@ BEGIN
     -- 1. Validate admin exists
     SELECT is_active INTO v_admin_active
     FROM activity.users
-    WHERE user_id = p_admin_user_id;
+    WHERE activity.users.user_id = p_admin_user_id;
 
     IF v_admin_active IS NULL THEN
         RAISE EXCEPTION 'ADMIN_NOT_FOUND: Admin user does not exist';
@@ -551,8 +551,8 @@ CREATE OR REPLACE FUNCTION activity.sp_mod_ban_user(
     p_admin_user_id UUID,
     p_user_id UUID,
     p_ban_type VARCHAR(20),
-    p_ban_duration_hours INT DEFAULT NULL,
-    p_ban_reason TEXT
+    p_ban_reason TEXT,
+    p_ban_duration_hours INT DEFAULT NULL
 ) RETURNS JSON
 LANGUAGE plpgsql
 AS $$
@@ -776,19 +776,8 @@ BEGIN
             RAISE EXCEPTION 'CONTENT_NOT_FOUND: Comment with specified ID does not exist';
         END IF;
 
-        -- Check if already removed
-        IF EXISTS (
-            SELECT 1 FROM activity.comments
-            WHERE comment_id = p_content_id
-            AND is_deleted = TRUE
-        ) THEN
-            RAISE EXCEPTION 'CONTENT_ALREADY_REMOVED: This content has already been removed';
-        END IF;
-
-        -- Update comment
-        UPDATE activity.comments
-        SET is_deleted = TRUE,
-            updated_at = NOW()
+        -- Delete comment (comments don't have soft delete, they CASCADE on post deletion)
+        DELETE FROM activity.comments
         WHERE comment_id = p_content_id;
 
         v_content_exists := TRUE;
@@ -877,9 +866,9 @@ BEGIN
             ),
             'total_bans', 0,  -- Would need ban history tracking
             'total_content_removed', (
-                SELECT
-                    (SELECT COUNT(*) FROM activity.posts WHERE author_user_id = p_target_user_id AND status = 'removed'::activity.content_status) +
-                    (SELECT COUNT(*) FROM activity.comments WHERE author_user_id = p_target_user_id AND is_deleted = TRUE)
+                SELECT COUNT(*) FROM activity.posts
+                WHERE author_user_id = p_target_user_id
+                AND status = 'removed'::activity.content_status
             ),
             'total_photo_rejections', 0  -- Would need photo rejection history
         ),
@@ -1021,12 +1010,7 @@ BEGIN
                 WHERE status = 'removed'::activity.content_status
                 AND updated_at BETWEEN v_date_from AND v_date_to
             ),
-            'comments_removed', (
-                SELECT COUNT(*)
-                FROM activity.comments
-                WHERE is_deleted = TRUE
-                AND updated_at BETWEEN v_date_from AND v_date_to
-            )
+            'comments_removed', 0  -- Comments are hard-deleted, no soft delete tracking
         ),
         'photos', json_build_object(
             'pending_moderation', (

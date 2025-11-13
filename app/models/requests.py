@@ -1,11 +1,12 @@
-from pydantic import BaseModel, Field, UUID4
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
+from uuid import UUID
 
 # Report models
 class CreateReportRequest(BaseModel):
     target_type: str = Field(..., pattern="^(user|post|comment|activity|community)$")
-    target_id: UUID4
+    target_id: UUID
     report_type: str = Field(..., pattern="^(spam|harassment|inappropriate|fake|no_show|other)$")
     description: Optional[str] = Field(None, max_length=2000)
 
@@ -15,7 +16,7 @@ class UpdateReportStatusRequest(BaseModel):
 
 # Photo moderation models
 class ModeratePhotoRequest(BaseModel):
-    user_id: UUID4
+    user_id: UUID
     moderation_status: str = Field(..., pattern="^(approved|rejected)$")
     rejection_reason: Optional[str] = Field(None, max_length=500)
 
@@ -31,5 +32,5 @@ class UnbanUserRequest(BaseModel):
 # Content removal models
 class RemoveContentRequest(BaseModel):
     content_type: str = Field(..., pattern="^(post|comment)$")
-    content_id: UUID4
+    content_id: UUID
     removal_reason: str = Field(..., max_length=1000)

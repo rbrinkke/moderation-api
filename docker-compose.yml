@@ -1,49 +1,21 @@
-version: '3.8'
-
 services:
   moderation-api:
     build: .
     ports:
-      - "8000:8000"
+      - "8002:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/activities_db
-      - REDIS_URL=redis://redis:6379/0
-      - JWT_SECRET_KEY=dev-secret-key-change-in-production
+      - DATABASE_URL=postgresql://postgres:postgres_secure_password_change_in_prod@activity-postgres-db:5432/activitydb
+      - REDIS_URL=redis://auth-redis:6379/0
+      - JWT_SECRET_KEY=dev_secret_key_change_in_production_min_32_chars_required
       - JWT_ALGORITHM=HS256
       - EMAIL_API_URL=http://email-api:8002
       - AUTH_API_URL=http://auth-api:8000
       - ENVIRONMENT=development
       - DEBUG=true
-    depends_on:
-      - postgres
-      - redis
     networks:
-      - app-network
-
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=activities_db
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d
-    networks:
-      - app-network
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    networks:
-      - app-network
-
-volumes:
-  postgres_data:
+      - activity-network
+    container_name: moderation-api
 
 networks:
-  app-network:
-    driver: bridge
+  activity-network:
+    external: true
