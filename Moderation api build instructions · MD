@@ -1,0 +1,1375 @@
+# MODERATION API - AI AGENT BUILD INSTRUCTIONS
+**Target Agent:** Claude Code  
+**Execution Mode:** Autonomous  
+**Repository:** GitHub (specifications already uploaded)  
+**Build Order:** Sequential - complete each phase before proceeding
+
+---
+
+## AGENT OBJECTIVE
+
+Build a production-ready FastAPI Moderation API that implements 100% of the specifications in `MODERATION_API_SPECS.md`. The API must use stored procedures exclusively for database access, follow the established patterns from auth-api, and integrate with existing email-api and image-api services.
+
+---
+
+## PRE-BUILD VERIFICATION
+
+**CRITICAL: Before starting, verify these files exist in the repository:**
+1. ✅ `MODERATION_API_SPECS.md` - Complete API specifications
+2. ✅ `auth-api-specifications.txt` - Reference for JWT patterns
+3. ✅ `fastapi-requirements.txt` - General FastAPI blueprint
+4. ✅ `sqlschema.sql` - Database schema with all tables
+
+**If any file is missing, STOP and request the missing file.**
+
+---
+
+## BUILD PHASES
+
+Execute in strict sequential order. Do not proceed to next phase until current phase is 100% complete and tested.
+
+---
+
+## PHASE 1: PROJECT INITIALIZATION
+
+### Task 1.1: Create Project Structure
+```
+moderation-api/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   ├── reports.py
+│   │   ├── photos.py
+│   │   ├── users.py
+│   │   ├── content.py
+│   │   └── statistics.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── requests.py
+│   │   └── responses.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── database.py
+│   │   ├── auth.py
+│   │   └── email.py
+│   ├── middleware/
+│   │   ├── __init__.py
+│   │   ├── auth.py
+│   │   └── correlation.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── errors.py
+│       └── rate_limit.py
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py
+│   ├── test_reports.py
+│   ├── test_photos.py
+│   ├── test_users.py
+│   ├── test_content.py
+│   └── test_statistics.py
+├── .env.example
+├── .gitignore
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
+```
+
+**Action:** Create all directories and empty `__init__.py` files.
+
+**Verification:** Run `tree` command and confirm structure matches exactly.
+
+---
+
+### Task 1.2: Create requirements.txt
+
+**Source:** Use specifications from `fastapi-requirements.txt` + `MODERATION_API_SPECS.md`
+
+**File Content:**
+```txt
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+asyncpg==0.29.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+redis==5.0.1
+slowapi==0.1.9
+httpx==0.26.0
+structlog==24.1.0
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+```
+
+**Action:** Create `requirements.txt` with exact versions listed above.
+
+**Verification:** Run `pip install -r requirements.txt` in virtual environment - must succeed with zero errors.
+
+---
+
+### Task 1.3: Create .env.example
+
+**File Content:**
+```bash
+# Environment
+ENVIRONMENT=development
+DEBUG=true
+
+# API
+API_V1_PREFIX=/moderation
+PROJECT_NAME=Moderation API
+
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/activities_db
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# JWT (from auth-api)
+JWT_SECRET_KEY=your-secret-key-here
+JWT_ALGORITHM=HS256
+
+# External APIs
+EMAIL_API_URL=http://email-api:8002
+AUTH_API_URL=http://auth-api:8000
+
+# Rate Limiting
+RATE_LIMIT_ENABLED=true
+
+# Logging
+LOG_LEVEL=INFO
+```
+
+**Action:** Create `.env.example` file with exact content above.
+
+**Verification:** File exists and contains all required variables.
+
+---
+
+### Task 1.4: Create .gitignore
+
+**File Content:**
+```
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+```
+
+**Action:** Create `.gitignore` file.
+
+**Verification:** File exists.
+
+---
+
+## PHASE 2: CORE CONFIGURATION & UTILITIES
+
+### Task 2.1: Implement app/config.py
+
+**Source:** Reference `fastapi-requirements.txt` section "Configuratie Patroon"
+
+**Implementation:**
+```python
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    # Environment
+    ENVIRONMENT: str = "development"
+    DEBUG: bool = False
+    
+    # API
+    API_V1_PREFIX: str = "/moderation"
+    PROJECT_NAME: str = "Moderation API"
+    
+    # Database
+    DATABASE_URL: str
+    
+    # Redis
+    REDIS_URL: str
+    
+    # JWT (from auth-api)
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    
+    # External APIs
+    EMAIL_API_URL: str
+    AUTH_API_URL: str
+    
+    # Rate Limiting
+    RATE_LIMIT_ENABLED: bool = True
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+settings = Settings()
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** 
+- Import in Python REPL: `from app.config import settings`
+- Print settings: `print(settings.PROJECT_NAME)`
+- Must succeed without errors.
+
+---
+
+### Task 2.2: Implement app/utils/errors.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` section "Error Handling & Status Codes"
+
+**Implementation:**
+```python
+from fastapi import HTTPException
+from typing import Dict
+
+# Error code to HTTP status mapping
+ERROR_CODE_MAPPING: Dict[str, int] = {
+    # 400 Bad Request
+    'INVALID_TARGET_TYPE': 400,
+    'INVALID_REPORT_TYPE': 400,
+    'INVALID_STATUS': 400,
+    'INVALID_MODERATION_STATUS': 400,
+    'INVALID_BAN_TYPE': 400,
+    'INVALID_DURATION': 400,
+    'INVALID_CONTENT_TYPE': 400,
+    'INVALID_STATUS_TRANSITION': 400,
+    'INVALID_DATE_RANGE': 400,
+    'DURATION_REQUIRED': 400,
+    'USER_ALREADY_BANNED': 400,
+    'USER_NOT_BANNED': 400,
+    'CONTENT_ALREADY_REMOVED': 400,
+    'NO_MAIN_PHOTO': 400,
+    'CANNOT_SELF_REPORT': 400,
+    'CANNOT_SELF_BAN': 400,
+    
+    # 403 Forbidden
+    'INSUFFICIENT_PERMISSIONS': 403,
+    'ADMIN_INACTIVE': 403,
+    
+    # 404 Not Found
+    'REPORTER_NOT_FOUND': 404,
+    'ADMIN_NOT_FOUND': 404,
+    'USER_NOT_FOUND': 404,
+    'TARGET_NOT_FOUND': 404,
+    'REPORT_NOT_FOUND': 404,
+    'CONTENT_NOT_FOUND': 404,
+    
+    # 409 Conflict
+    'DUPLICATE_REPORT': 409,
+}
+
+def map_sp_error_to_http(error_message: str) -> tuple[int, str]:
+    """
+    Map stored procedure error to HTTP status code.
+    
+    Args:
+        error_message: Error message from PostgreSQL (format: "ERROR_CODE: message")
+        
+    Returns:
+        Tuple of (status_code, error_message)
+    """
+    # Extract error code (before colon)
+    error_code = error_message.split(':')[0].strip() if ':' in error_message else error_message.strip()
+    
+    # Look up status code
+    status_code = ERROR_CODE_MAPPING.get(error_code, 500)
+    
+    return status_code, error_message
+
+class AppException(HTTPException):
+    """Base exception for application errors"""
+    pass
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:**
+- Import: `from app.utils.errors import map_sp_error_to_http`
+- Test: `assert map_sp_error_to_http("USER_NOT_FOUND: User does not exist") == (404, "USER_NOT_FOUND: User does not exist")`
+
+---
+
+### Task 2.3: Implement app/middleware/correlation.py
+
+**Source:** Reference `fastapi-requirements.txt` section "Correlation ID Middleware"
+
+**Implementation:**
+```python
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+import structlog
+import uuid
+
+class CorrelationMiddleware(BaseHTTPMiddleware):
+    """Add correlation ID to all requests for tracing"""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Get correlation ID from header or generate new one
+        correlation_id = request.headers.get("X-Trace-ID") or str(uuid.uuid4())
+        
+        # Bind to structlog context
+        structlog.contextvars.bind_contextvars(correlation_id=correlation_id)
+        
+        # Process request
+        response = await call_next(request)
+        
+        # Add correlation ID to response header
+        response.headers["X-Trace-ID"] = correlation_id
+        
+        return response
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** File exists, imports succeed.
+
+---
+
+## PHASE 3: DATABASE & EXTERNAL SERVICES
+
+### Task 3.1: Implement app/services/database.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` section "Database Connection Pattern"
+
+**Implementation:**
+```python
+import asyncpg
+from asyncpg.pool import Pool
+from app.config import settings
+import structlog
+
+logger = structlog.get_logger()
+
+class Database:
+    """PostgreSQL database connection pool manager"""
+    
+    def __init__(self):
+        self.pool: Pool = None
+    
+    async def connect(self):
+        """Establish database connection pool"""
+        try:
+            self.pool = await asyncpg.create_pool(
+                dsn=settings.DATABASE_URL,
+                min_size=5,
+                max_size=20,
+                command_timeout=60
+            )
+            logger.info("database_connected", min_size=5, max_size=20)
+        except Exception as e:
+            logger.error("database_connection_failed", error=str(e))
+            raise
+    
+    async def disconnect(self):
+        """Close database connection pool"""
+        if self.pool:
+            await self.pool.close()
+            logger.info("database_disconnected")
+    
+    async def fetch_one(self, query: str, *args):
+        """Execute query and fetch single row"""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
+    
+    async def fetch_all(self, query: str, *args):
+        """Execute query and fetch all rows"""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+    
+    async def execute(self, query: str, *args):
+        """Execute query without returning results"""
+        async with self.pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+# Global database instance
+db = Database()
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** Import succeeds: `from app.services.database import db`
+
+---
+
+### Task 3.2: Implement app/services/email.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` section "Email API Client Pattern"
+
+**Implementation:**
+```python
+import httpx
+from app.config import settings
+import structlog
+
+logger = structlog.get_logger()
+
+class EmailAPIClient:
+    """Client for email-api service"""
+    
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(timeout=30.0)
+    
+    async def send_email(self, to: str, template: str, context: dict):
+        """
+        Send email via email-api service.
+        
+        Args:
+            to: Recipient email address
+            template: Email template name
+            context: Template context data
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/emails/send",
+                json={
+                    "to": to,
+                    "template": template,
+                    "context": context
+                }
+            )
+            response.raise_for_status()
+            logger.info("email_sent", to=to, template=template)
+            return response.json()
+        except httpx.HTTPError as e:
+            # Log error but don't fail the request
+            logger.error("email_send_failed", error=str(e), to=to, template=template)
+            # Email failure should not break the API response
+            return None
+    
+    async def close(self):
+        """Close HTTP client"""
+        await self.client.aclose()
+
+# Global email client instance
+email_client = EmailAPIClient(settings.EMAIL_API_URL)
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** Import succeeds: `from app.services.email import email_client`
+
+---
+
+### Task 3.3: Implement app/middleware/auth.py
+
+**Source:** Reference `auth-api-specifications.txt` for JWT structure and `MODERATION_API_SPECS.md` for admin validation
+
+**Implementation:**
+```python
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+from app.config import settings
+import structlog
+
+logger = structlog.get_logger()
+security = HTTPBearer()
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    """
+    Extract and validate user from JWT token.
+    
+    Returns:
+        dict with user_id, email, roles
+    """
+    try:
+        # Decode JWT token
+        payload = jwt.decode(
+            credentials.credentials,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        
+        # Extract user_id from 'sub' claim
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials"
+            )
+        
+        return {
+            "user_id": user_id,
+            "email": payload.get("email"),
+            "roles": payload.get("roles", [])
+        }
+    except JWTError as e:
+        logger.error("jwt_validation_failed", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Validate user has admin or moderator role.
+    
+    Returns:
+        dict with user_id, email, roles
+    """
+    roles = current_user.get("roles", [])
+    
+    if "admin" not in roles and "moderator" not in roles:
+        logger.warning("insufficient_permissions", user_id=current_user["user_id"], roles=roles)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+        )
+    
+    return current_user
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** Import succeeds: `from app.middleware.auth import get_current_user, require_admin`
+
+---
+
+## PHASE 4: PYDANTIC MODELS
+
+### Task 4.1: Implement app/models/requests.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` for all request body schemas
+
+**Implementation:**
+```python
+from pydantic import BaseModel, Field, UUID4
+from typing import Optional
+from datetime import datetime
+
+# Report models
+class CreateReportRequest(BaseModel):
+    target_type: str = Field(..., pattern="^(user|post|comment|activity|community)$")
+    target_id: UUID4
+    report_type: str = Field(..., pattern="^(spam|harassment|inappropriate|fake|no_show|other)$")
+    description: Optional[str] = Field(None, max_length=2000)
+
+class UpdateReportStatusRequest(BaseModel):
+    status: str = Field(..., pattern="^(reviewing|resolved|dismissed)$")
+    resolution_notes: Optional[str] = Field(None, max_length=2000)
+
+# Photo moderation models
+class ModeratePhotoRequest(BaseModel):
+    user_id: UUID4
+    moderation_status: str = Field(..., pattern="^(approved|rejected)$")
+    rejection_reason: Optional[str] = Field(None, max_length=500)
+
+# Ban models
+class BanUserRequest(BaseModel):
+    ban_type: str = Field(..., pattern="^(permanent|temporary)$")
+    ban_duration_hours: Optional[int] = Field(None, gt=0)
+    ban_reason: str = Field(..., max_length=1000)
+
+class UnbanUserRequest(BaseModel):
+    unban_reason: str = Field(..., max_length=1000)
+
+# Content removal models
+class RemoveContentRequest(BaseModel):
+    content_type: str = Field(..., pattern="^(post|comment)$")
+    content_id: UUID4
+    removal_reason: str = Field(..., max_length=1000)
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** 
+- Import: `from app.models.requests import CreateReportRequest`
+- Validate: `CreateReportRequest(target_type="post", target_id="550e8400-e29b-41d4-a716-446655440000", report_type="spam")`
+
+---
+
+### Task 4.2: Implement app/models/responses.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` for all response schemas
+
+**Implementation:**
+```python
+from pydantic import BaseModel, UUID4
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
+# Report responses
+class CreateReportResponse(BaseModel):
+    success: bool
+    report_id: UUID4
+    status: str
+    created_at: datetime
+
+class ReporterInfo(BaseModel):
+    user_id: UUID4
+    username: str
+    email: str
+
+class ReportResponse(BaseModel):
+    report_id: UUID4
+    reporter: ReporterInfo
+    reported_user: Optional[ReporterInfo]
+    target_type: str
+    target_id: UUID4
+    report_type: str
+    description: Optional[str]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+class GetReportsResponse(BaseModel):
+    success: bool
+    reports: List[ReportResponse]
+    pagination: Dict[str, Any]
+
+# Photo moderation responses
+class PendingPhoto(BaseModel):
+    user_id: UUID4
+    username: str
+    email: str
+    main_photo_url: str
+    created_at: datetime
+    updated_at: datetime
+
+class GetPendingPhotosResponse(BaseModel):
+    success: bool
+    pending_photos: List[PendingPhoto]
+    pagination: Dict[str, Any]
+
+class ModeratePhotoResponse(BaseModel):
+    success: bool
+    user_id: UUID4
+    main_photo_url: str
+    moderation_status: str
+    moderated_at: datetime
+
+# Ban responses
+class BanUserResponse(BaseModel):
+    success: bool
+    user_id: UUID4
+    status: str
+    ban_expires_at: Optional[datetime]
+    ban_reason: str
+    banned_at: datetime
+
+class UnbanUserResponse(BaseModel):
+    success: bool
+    user_id: UUID4
+    status: str
+    unbanned_at: datetime
+    unbanned_by_user_id: UUID4
+
+# Content removal response
+class RemoveContentResponse(BaseModel):
+    success: bool
+    content_type: str
+    content_id: UUID4
+    status: str
+    removed_at: datetime
+    removed_by_user_id: UUID4
+
+# Generic response
+class SuccessResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:** Import succeeds: `from app.models.responses import CreateReportResponse`
+
+---
+
+## PHASE 5: API ROUTES IMPLEMENTATION
+
+### Task 5.1: Implement app/routes/reports.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` endpoints 1-4
+
+**Critical Requirements:**
+1. Use `db.fetch_one()` or `db.fetch_all()` for ALL database calls
+2. Call stored procedures with exact parameter order from specs
+3. Use `map_sp_error_to_http()` for error handling
+4. Apply rate limiting using `@limiter.limit()`
+5. Use `Depends(get_current_user)` or `Depends(require_admin)`
+
+**Implementation Pattern:**
+```python
+from fastapi import APIRouter, Depends, HTTPException, Query
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+import asyncpg
+
+from app.models.requests import CreateReportRequest, UpdateReportStatusRequest
+from app.models.responses import CreateReportResponse, GetReportsResponse
+from app.services.database import db
+from app.middleware.auth import get_current_user, require_admin
+from app.utils.errors import map_sp_error_to_http
+import structlog
+
+logger = structlog.get_logger()
+router = APIRouter(prefix="/moderation", tags=["reports"])
+limiter = Limiter(key_func=get_remote_address)
+
+@router.post("/reports", response_model=CreateReportResponse, status_code=201)
+@limiter.limit("10/minute")
+async def create_report(
+    request: CreateReportRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new report for problematic content or behavior"""
+    try:
+        result = await db.fetch_one(
+            "SELECT * FROM activity.sp_mod_create_report($1, $2, $3, $4, $5, $6)",
+            current_user["user_id"],
+            None,  # reported_user_id (SP determines this)
+            request.target_type,
+            request.target_id,
+            request.report_type,
+            request.description
+        )
+        
+        # Parse JSON result from stored procedure
+        import json
+        data = json.loads(result[0])
+        
+        logger.info("report_created", report_id=data["report_id"], user_id=current_user["user_id"])
+        return CreateReportResponse(**data)
+        
+    except asyncpg.PostgresError as e:
+        status_code, message = map_sp_error_to_http(str(e))
+        logger.error("create_report_failed", error=message, user_id=current_user["user_id"])
+        raise HTTPException(status_code=status_code, detail=message)
+
+@router.get("/reports", response_model=GetReportsResponse)
+@limiter.limit("100/minute")
+async def get_reports(
+    status: Optional[str] = Query(None, pattern="^(pending|reviewing|resolved|dismissed)$"),
+    target_type: Optional[str] = Query(None, pattern="^(user|post|comment|activity|community)$"),
+    report_type: Optional[str] = Query(None, pattern="^(spam|harassment|inappropriate|fake|no_show|other)$"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    admin: dict = Depends(require_admin)
+):
+    """Get reports with filtering (admin only)"""
+    try:
+        reports = await db.fetch_all(
+            "SELECT * FROM activity.sp_mod_get_reports($1, $2, $3, $4, $5, $6)",
+            admin["user_id"],
+            status,
+            target_type,
+            report_type,
+            limit,
+            offset
+        )
+        
+        # Convert asyncpg.Record to dict
+        reports_list = [dict(r) for r in reports]
+        
+        # TODO: Get total count for pagination
+        
+        return GetReportsResponse(
+            success=True,
+            reports=reports_list,
+            pagination={"limit": limit, "offset": offset, "total": len(reports_list)}
+        )
+        
+    except asyncpg.PostgresError as e:
+        status_code, message = map_sp_error_to_http(str(e))
+        logger.error("get_reports_failed", error=message, admin_id=admin["user_id"])
+        raise HTTPException(status_code=status_code, detail=message)
+
+# TODO: Implement remaining endpoints:
+# - GET /moderation/reports/{report_id}
+# - PATCH /moderation/reports/{report_id}/status
+```
+
+**Action:** 
+1. Create file with COMPLETE implementation of all 4 endpoints from specs
+2. Follow the pattern shown above EXACTLY
+3. Each endpoint must call the correct stored procedure with correct parameters
+4. Each endpoint must have proper error handling with `map_sp_error_to_http()`
+
+**Verification:**
+- Import succeeds: `from app.routes.reports import router`
+- All 4 endpoints implemented
+- Each endpoint has rate limiting
+- Each endpoint has authentication dependency
+
+---
+
+### Task 5.2: Implement app/routes/photos.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` endpoints 5-6
+
+**Implementation Requirements:**
+- Endpoint 5: GET /moderation/photos/pending
+- Endpoint 6: POST /moderation/photos/moderate
+- Follow exact same pattern as reports.py
+- Include email notification call AFTER successful photo rejection
+
+**Action:** Create complete file with both endpoints.
+
+**Verification:** Both endpoints implemented and import succeeds.
+
+---
+
+### Task 5.3: Implement app/routes/users.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` endpoints 7-8, 10
+
+**Implementation Requirements:**
+- Endpoint 7: POST /moderation/users/{user_id}/ban
+- Endpoint 8: POST /moderation/users/{user_id}/unban
+- Endpoint 10: GET /moderation/users/{user_id}/history
+- Follow exact same pattern as reports.py
+- Include email notification calls AFTER successful ban/unban
+
+**Action:** Create complete file with all three endpoints.
+
+**Verification:** All endpoints implemented and import succeeds.
+
+---
+
+### Task 5.4: Implement app/routes/content.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` endpoint 9
+
+**Implementation Requirements:**
+- Endpoint 9: POST /moderation/content/remove
+- Follow exact same pattern as reports.py
+- Include email notification call AFTER successful content removal
+
+**Action:** Create complete file with endpoint.
+
+**Verification:** Endpoint implemented and import succeeds.
+
+---
+
+### Task 5.5: Implement app/routes/statistics.py
+
+**Source:** Reference `MODERATION_API_SPECS.md` endpoint 11
+
+**Implementation Requirements:**
+- Endpoint 11: GET /moderation/statistics
+- Follow exact same pattern as reports.py
+- Handle optional date range parameters
+
+**Action:** Create complete file with endpoint.
+
+**Verification:** Endpoint implemented and import succeeds.
+
+---
+
+## PHASE 6: MAIN APPLICATION SETUP
+
+### Task 6.1: Implement app/main.py
+
+**Source:** Reference `fastapi-requirements.txt` and `auth-api-specifications.txt`
+
+**Implementation:**
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import structlog
+
+from app.config import settings
+from app.services.database import db
+from app.services.email import email_client
+from app.middleware.correlation import CorrelationMiddleware
+
+# Import all routers
+from app.routes import reports, photos, users, content, statistics
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer() if settings.ENVIRONMENT == "production" 
+        else structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan events"""
+    # Startup
+    logger.info("application_starting", environment=settings.ENVIRONMENT)
+    await db.connect()
+    logger.info("application_started")
+    
+    yield
+    
+    # Shutdown
+    logger.info("application_stopping")
+    await db.disconnect()
+    await email_client.close()
+    logger.info("application_stopped")
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add correlation ID middleware
+app.add_middleware(CorrelationMiddleware)
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    # TODO: Add database health check
+    return {"status": "ok", "service": "moderation-api"}
+
+# Include all routers
+app.include_router(reports.router, prefix=settings.API_V1_PREFIX)
+app.include_router(photos.router, prefix=settings.API_V1_PREFIX)
+app.include_router(users.router, prefix=settings.API_V1_PREFIX)
+app.include_router(content.router, prefix=settings.API_V1_PREFIX)
+app.include_router(statistics.router, prefix=settings.API_V1_PREFIX)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG
+    )
+```
+
+**Action:** Create file with exact implementation above.
+
+**Verification:**
+- Import: `from app.main import app`
+- Run: `python -m app.main` (should start without errors)
+
+---
+
+## PHASE 7: DOCKER SETUP
+
+### Task 7.1: Create Dockerfile
+
+**Source:** Reference `fastapi-requirements.txt` section "Docker Setup"
+
+**Implementation:**
+```dockerfile
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser
+
+WORKDIR /app
+
+# Copy Python packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code
+COPY . .
+
+# Switch to non-root user
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import requests; requests.get('http://localhost:8000/health').raise_for_status()" || exit 1
+
+# Run application
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+**Action:** Create Dockerfile with exact content above.
+
+**Verification:** Run `docker build -t moderation-api .` - must succeed.
+
+---
+
+### Task 7.2: Create docker-compose.yml
+
+**Implementation:**
+```yaml
+version: '3.8'
+
+services:
+  moderation-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/activities_db
+      - REDIS_URL=redis://redis:6379/0
+      - JWT_SECRET_KEY=dev-secret-key-change-in-production
+      - JWT_ALGORITHM=HS256
+      - EMAIL_API_URL=http://email-api:8002
+      - AUTH_API_URL=http://auth-api:8000
+      - ENVIRONMENT=development
+      - DEBUG=true
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - app-network
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=activities_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+**Action:** Create file with exact content above.
+
+**Verification:** Run `docker-compose up -d` - all services start.
+
+---
+
+## PHASE 8: STORED PROCEDURES CREATION
+
+### Task 8.1: Create SQL Migration File
+
+**Source:** Reference `MODERATION_API_SPECS.md` section "Stored Procedures Specifications"
+
+**File:** `migrations/001_moderation_stored_procedures.sql`
+
+**Action:** Create SQL file implementing ALL 11 stored procedures from specifications:
+1. sp_mod_create_report
+2. sp_mod_get_reports
+3. sp_mod_get_report_by_id
+4. sp_mod_update_report_status
+5. sp_mod_moderate_main_photo
+6. sp_mod_get_pending_photos
+7. sp_mod_ban_user
+8. sp_mod_unban_user
+9. sp_mod_remove_content
+10. sp_mod_get_user_moderation_history
+11. sp_mod_get_statistics
+
+**Implementation Requirements:**
+- Each SP must match signature EXACTLY from specs
+- Each SP must implement ALL business logic from specs
+- Each SP must use correct RAISE EXCEPTION codes from specs
+- Each SP must return JSON or TABLE as specified
+- Test each SP manually after creation
+
+**Verification:**
+- Connect to database: `psql -U postgres -d activities_db`
+- Run migration: `\i migrations/001_moderation_stored_procedures.sql`
+- Check SP exists: `\df activity.sp_mod_*`
+- Test call: `SELECT activity.sp_mod_get_statistics('test-uuid', NULL, NULL);`
+
+---
+
+## PHASE 9: TESTING
+
+### Task 9.1: Create test fixtures (tests/conftest.py)
+
+**Implementation:**
+```python
+import pytest
+import asyncio
+from httpx import AsyncClient
+from app.main import app
+from app.services.database import db
+
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create event loop for async tests"""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest.fixture
+async def client():
+    """Create test client"""
+    async with AsyncClient(app=app, base_url="http://test") as ac:
+        yield ac
+
+@pytest.fixture
+async def admin_token():
+    """Generate admin JWT token for testing"""
+    # TODO: Generate valid JWT with admin role
+    pass
+
+@pytest.fixture
+async def user_token():
+    """Generate user JWT token for testing"""
+    # TODO: Generate valid JWT with regular user role
+    pass
+```
+
+**Action:** Create conftest.py with fixtures.
+
+---
+
+### Task 9.2: Create endpoint tests
+
+**Action:** Create test files for each route module:
+- tests/test_reports.py
+- tests/test_photos.py
+- tests/test_users.py
+- tests/test_content.py
+- tests/test_statistics.py
+
+**Test Coverage Requirements:**
+- Each endpoint must have at least 3 tests:
+  1. Success case
+  2. Authentication failure (401)
+  3. Authorization failure (403) for admin endpoints
+- Additional tests for validation errors (422)
+- Additional tests for business logic errors (400, 404, 409)
+
+**Verification:** Run `pytest tests/ -v` - all tests pass.
+
+---
+
+## PHASE 10: DOCUMENTATION
+
+### Task 10.1: Create README.md
+
+**Content Requirements:**
+- Project description
+- Prerequisites
+- Installation instructions
+- Configuration (environment variables)
+- Running the application
+- Docker deployment
+- API documentation link
+- Testing instructions
+
+**Action:** Create comprehensive README.md.
+
+---
+
+### Task 10.2: Create API documentation
+
+**Action:** Add OpenAPI documentation in app/main.py:
+```python
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="Moderation API for activities platform",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    lifespan=lifespan
+)
+```
+
+**Verification:** 
+- Start app
+- Visit http://localhost:8000/docs
+- Verify all endpoints documented
+
+---
+
+## FINAL VERIFICATION CHECKLIST
+
+Before marking project complete, verify ALL items:
+
+### Code Quality
+- [ ] All files have proper imports
+- [ ] No unused imports
+- [ ] Consistent code formatting (use `black` formatter)
+- [ ] All functions have docstrings
+- [ ] All complex logic has inline comments
+
+### Functionality
+- [ ] All 11 stored procedures created and tested
+- [ ] All 11 API endpoints implemented
+- [ ] All endpoints call correct stored procedures
+- [ ] All endpoints have authentication
+- [ ] Admin endpoints have authorization check
+- [ ] Rate limiting applied to all endpoints
+- [ ] Email notifications sent after ban/unban/photo rejection/content removal
+
+### Error Handling
+- [ ] All endpoints use try-except for PostgresError
+- [ ] All endpoints use map_sp_error_to_http()
+- [ ] All error responses match specification format
+- [ ] Logging on all errors
+
+### Testing
+- [ ] All endpoints have tests
+- [ ] All tests pass
+- [ ] Test coverage > 80%
+
+### Documentation
+- [ ] README.md complete
+- [ ] OpenAPI docs accessible at /docs
+- [ ] All environment variables documented
+- [ ] Deployment instructions included
+
+### Docker
+- [ ] Dockerfile builds successfully
+- [ ] docker-compose.yml starts all services
+- [ ] Health check passes
+- [ ] Application accessible at localhost:8000
+
+---
+
+## COMPLETION CRITERIA
+
+Project is complete when:
+1. ✅ All phases 1-10 completed
+2. ✅ All items in final verification checklist checked
+3. ✅ Application runs without errors in Docker
+4. ✅ All API endpoints return correct responses
+5. ✅ All tests pass
+6. ✅ OpenAPI documentation accessible
+
+---
+
+## TROUBLESHOOTING GUIDE
+
+### Common Issues
+
+**Issue: "asyncpg.exceptions.PostgresError"**
+- Check database connection string in .env
+- Verify PostgreSQL is running
+- Check stored procedures exist in database
+
+**Issue: "401 Unauthorized"**
+- Check JWT_SECRET_KEY matches auth-api
+- Verify JWT token format
+- Check token expiry
+
+**Issue: "403 Forbidden"**
+- Verify JWT contains 'roles' claim
+- Check role is 'admin' or 'moderator'
+
+**Issue: "Import errors"**
+- Run `pip install -r requirements.txt`
+- Check Python version is 3.11+
+- Verify virtual environment activated
+
+**Issue: "Rate limit exceeded"**
+- Check Redis is running
+- Verify REDIS_URL in .env
+- Check rate limit configuration
+
+---
+
+## SUCCESS METRICS
+
+Upon completion, the API should:
+- ✅ Start in < 5 seconds
+- ✅ Respond to health check in < 100ms
+- ✅ Handle 100 requests/second without errors
+- ✅ Have zero critical security vulnerabilities
+- ✅ Pass all automated tests
+- ✅ Match 100% of specification requirements
+
+---
+
+## NOTES FOR AI AGENT
+
+1. **Execute sequentially**: Complete each task before moving to next
+2. **Verify after each task**: Run verification steps immediately
+3. **No shortcuts**: Implement ALL business logic from specs
+4. **Exact matches**: Function signatures must match specs exactly
+5. **Error handling**: Every endpoint must have proper error handling
+6. **Testing**: Write tests as you build, not at the end
+7. **Logging**: Add structured logging to all important operations
+8. **Documentation**: Document as you code, not after
+
+When stuck:
+- Re-read the specification section
+- Check reference files (auth-api, fastapi-requirements)
+- Verify all dependencies installed
+- Check database connection
+- Review error logs
+
+When complete:
+- Run full test suite
+- Start application in Docker
+- Test all endpoints via /docs interface
+- Review all logs for errors
+- Verify all emails sent correctly
