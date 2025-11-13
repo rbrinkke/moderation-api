@@ -1,0 +1,2190 @@
+# MODERATION API SPECIFICATIONS
+**Version:** 1.0  
+**Target:** AI Code Agent (Claude Code / Cursor / etc.)  
+**Stack:** FastAPI + Python 3.11+ + PostgreSQL + Redis  
+**Authentication:** JWT Bearer tokens (from auth-api)  
+**Database Access:** 100% Stored Procedures (NO direct queries)
+
+---
+
+## TABLE OF CONTENTS
+1. [API Overview](#api-overview)
+2. [Database Schema Reference](#database-schema-reference)
+3. [Stored Procedures Specifications](#stored-procedures-specifications)
+4. [API Endpoints Specifications](#api-endpoints-specifications)
+5. [Error Handling & Status Codes](#error-handling--status-codes)
+6. [Business Rules](#business-rules)
+7. [Rate Limiting](#rate-limiting)
+8. [Testing Checklist](#testing-checklist)
+
+---
+
+## API OVERVIEW
+
+### Purpose
+The Moderation API provides safety and trust layer for the activities platform. It handles:
+- User reports (spam, harassment, inappropriate content, no-shows, etc.)
+- Main photo moderation (approve/reject profile photos)
+- Admin moderation queue management
+- User ban/unban functionality
+- Content removal (posts, comments, activities)
+- Trust & safety metrics tracking
+
+### Core Responsibilities
+1. **Report Management**: Users report problematic content/behavior
+2. **Photo Moderation**: Admins approve/reject main profile photos
+3. **User Sanctions**: Ban/unban users with reason tracking
+4. **Content Moderation**: Hide/remove flagged content
+5. **Moderation Queue**: Admin dashboard for pending reports
+6. **Metrics**: Track moderation actions for trust scoring
+
+### Dependencies
+- **auth-api**: User authentication (JWT tokens with user_id, org_id claims)
+- **email-api**: Send ban notifications, warning emails
+- **PostgreSQL**: All data persistence via stored procedures
+- **Redis**: Rate limiting only
+
+### Key Constraints
+- All database operations MUST use stored procedures (schema: `activity`)
+- Authentication via JWT Bearer token (extract user_id from token)
+- Admin-only endpoints require role validation (use RBAC from auth-api JWT)
+- No direct SQL queries in API code
+- All timestamps in UTC (ISO 8601 format)
+- UUIDs use uuidv7() for sortable identifiers
+
+---
+
+## DATABASE SCHEMA REFERENCE
+
+### Relevant Tables
+
+#### activity.users
+```sql
+Columns:
+- user_id UUID PRIMARY KEY
+- email VARCHAR(255)
+- username VARCHAR(100)
+- main_photo_url VARCHAR(500)
+- main_photo_moderation_status activity.photo_moderation_status DEFAULT 'pending'
+  -- Values: 'pending', 'approved', 'rejected'
+- status activity.user_status DEFAULT 'active'
+  -- Values: 'active', 'temporary_ban', 'banned'
+- ban_expires_at TIMESTAMP WITH TIME ZONE
+- ban_reason TEXT
+- no_show_count INT DEFAULT 0
+- is_verified BOOLEAN DEFAULT FALSE
+- verification_count INT DEFAULT 0
+- created_at TIMESTAMP WITH TIME ZONE
+- updated_at TIMESTAMP WITH TIME ZONE
+```
+
+#### activity.reports
+```sql
+Columns:
+- report_id UUID PRIMARY KEY
+- reporter_user_id UUID NOT NULL REFERENCES users(user_id)
+- reported_user_id UUID REFERENCES users(user_id) -- NULL for content reports
+- target_type VARCHAR(50) NOT NULL
+  -- Values: 'user', 'post', 'comment', 'activity', 'community'
+- target_id UUID NOT NULL
+- report_type activity.report_type NOT NULL
+  -- Values: 'spam', 'harassment', 'inappropriate', 'fake', 'no_show', 'other'
+- description TEXT
+- status activity.report_status DEFAULT 'pending'
+  -- Values: 'pending', 'reviewing', 'resolved', 'dismissed'
+- reviewed_by_user_id UUID REFERENCES users(user_id)
+- reviewed_at TIMESTAMP WITH TIME ZONE
+- resolution_notes TEXT
+- created_at TIMESTAMP WITH TIME ZONE
+- updated_at TIMESTAMP WITH TIME ZONE
+- payload JSONB
+
+Indexes:
+- idx_reports_status ON (status, created_at)
+- idx_reports_target ON (target_type, target_id)
+- idx_reports_reporter ON (reporter_user_id)
+- idx_reports_reported_user ON (reported_user_id) WHERE reported_user_id IS NOT NULL
+```
+
+#### activity.posts
+```sql
+Columns:
+- post_id UUID PRIMARY KEY
+- community_id UUID NOT NULL
+- author_user_id UUID NOT NULL
+- content TEXT NOT NULL
+- status activity.content_status DEFAULT 'published'
+  -- Values: 'draft', 'published', 'archived', 'flagged', 'removed'
+- created_at TIMESTAMP WITH TIME ZONE
+- updated_at TIMESTAMP WITH TIME ZONE
+```
+
+#### activity.comments
+```sql
+Columns:
+- comment_id UUID PRIMARY KEY
+- post_id UUID NOT NULL
+- author_user_id UUID NOT NULL
+- content TEXT NOT NULL
+- is_deleted BOOLEAN DEFAULT FALSE
+- created_at TIMESTAMP WITH TIME ZONE
+- updated_at TIMESTAMP WITH TIME ZONE
+```
+
+#### activity.activities
+```sql
+Columns:
+- activity_id UUID PRIMARY KEY
+- organizer_user_id UUID NOT NULL
+- title VARCHAR(255)
+- status activity.activity_status DEFAULT 'published'
+  -- Values: 'draft', 'published', 'cancelled', 'completed'
+- created_at TIMESTAMP WITH TIME ZONE
+- updated_at TIMESTAMP WITH TIME ZONE
+```
+
+---
+
+## STORED PROCEDURES SPECIFICATIONS
+
+### Naming Convention
+All stored procedures:
+- Prefix: `sp_mod_` (moderation namespace)
+- Schema: `activity`
+- Return: JSON object or table
+- Error handling: RAISE EXCEPTION with specific messages
+
+---
+
+### 1. sp_mod_create_report
+
+**Purpose**: Create a new report for problematic content or user behavior
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_create_report(
+    p_reporter_user_id UUID,
+    p_reported_user_id UUID,         -- NULL for content reports
+    p_target_type VARCHAR(50),       -- 'user', 'post', 'comment', 'activity', 'community'
+    p_target_id UUID,
+    p_report_type VARCHAR(50),       -- 'spam', 'harassment', 'inappropriate', 'fake', 'no_show', 'other'
+    p_description TEXT
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate reporter_user_id exists and is active
+2. Validate target_type is one of allowed values
+3. Validate report_type is one of allowed values
+4. Check if target exists based on target_type:
+   - 'user': Check activity.users(user_id)
+   - 'post': Check activity.posts(post_id)
+   - 'comment': Check activity.comments(comment_id)
+   - 'activity': Check activity.activities(activity_id)
+   - 'community': Check activity.communities(community_id)
+5. If target_type = 'user', set p_reported_user_id = p_target_id
+6. Check duplicate: Same reporter + target + report_type within 24 hours
+7. Generate report_id using uuidv7()
+8. Insert into activity.reports with status='pending'
+9. If report_type = 'no_show' AND target_type = 'user':
+   - Increment reported_user.no_show_count by 1
+10. Return JSON with report details
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "report_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Cases**:
+- Reporter user not found → RAISE 'REPORTER_NOT_FOUND'
+- Reporter user not active → RAISE 'REPORTER_INACTIVE'
+- Invalid target_type → RAISE 'INVALID_TARGET_TYPE'
+- Invalid report_type → RAISE 'INVALID_REPORT_TYPE'
+- Target not found → RAISE 'TARGET_NOT_FOUND'
+- Duplicate report within 24h → RAISE 'DUPLICATE_REPORT'
+- Cannot report yourself → RAISE 'CANNOT_SELF_REPORT'
+
+---
+
+### 2. sp_mod_get_reports
+
+**Purpose**: Retrieve reports with filtering and pagination (admin view)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_get_reports(
+    p_admin_user_id UUID,
+    p_status VARCHAR(20) DEFAULT NULL,     -- Filter: 'pending', 'reviewing', 'resolved', 'dismissed'
+    p_target_type VARCHAR(50) DEFAULT NULL, -- Filter: 'user', 'post', 'comment', 'activity', 'community'
+    p_report_type VARCHAR(50) DEFAULT NULL, -- Filter: 'spam', 'harassment', etc.
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE (
+    report_id UUID,
+    reporter_user_id UUID,
+    reporter_username VARCHAR(100),
+    reporter_email VARCHAR(255),
+    reported_user_id UUID,
+    reported_username VARCHAR(100),
+    reported_email VARCHAR(255),
+    target_type VARCHAR(50),
+    target_id UUID,
+    report_type VARCHAR(50),
+    description TEXT,
+    status VARCHAR(20),
+    reviewed_by_user_id UUID,
+    reviewed_by_username VARCHAR(100),
+    reviewed_at TIMESTAMP WITH TIME ZONE,
+    resolution_notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE
+)
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and is active
+2. Validate admin has moderation permissions (check via RBAC or is_admin flag)
+3. Build WHERE clause based on filters:
+   - p_status IS NOT NULL → AND r.status = p_status
+   - p_target_type IS NOT NULL → AND r.target_type = p_target_type
+   - p_report_type IS NOT NULL → AND r.report_type = p_report_type
+4. JOIN with users table to get reporter/reported usernames and emails
+5. LEFT JOIN with users for reviewed_by user details
+6. ORDER BY r.created_at DESC (newest first)
+7. Apply LIMIT and OFFSET for pagination
+8. Return table rows
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin user not active → RAISE 'ADMIN_INACTIVE'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- Invalid status value → RAISE 'INVALID_STATUS'
+- Invalid target_type value → RAISE 'INVALID_TARGET_TYPE'
+- Invalid report_type value → RAISE 'INVALID_REPORT_TYPE'
+
+---
+
+### 3. sp_mod_get_report_by_id
+
+**Purpose**: Get detailed information for a single report
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_get_report_by_id(
+    p_admin_user_id UUID,
+    p_report_id UUID
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has moderation permissions
+2. Fetch report by report_id
+3. JOIN with users for reporter, reported, reviewer details
+4. Fetch target entity details based on target_type:
+   - 'user': Get user profile data
+   - 'post': Get post content + author
+   - 'comment': Get comment content + author + parent post
+   - 'activity': Get activity title + organizer
+   - 'community': Get community name + creator
+5. Return comprehensive JSON object
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "report": {
+    "report_id": "550e8400-e29b-41d4-a716-446655440000",
+    "reporter": {
+      "user_id": "...",
+      "username": "john_doe",
+      "email": "john@example.com"
+    },
+    "reported_user": {
+      "user_id": "...",
+      "username": "bad_actor",
+      "email": "bad@example.com",
+      "no_show_count": 3,
+      "verification_count": 5
+    },
+    "target": {
+      "type": "post",
+      "id": "...",
+      "content": "Offensive content here...",
+      "author_username": "bad_actor",
+      "created_at": "2025-01-10T15:00:00Z"
+    },
+    "report_type": "harassment",
+    "description": "User is repeatedly harassing members",
+    "status": "pending",
+    "reviewed_by": null,
+    "reviewed_at": null,
+    "resolution_notes": null,
+    "created_at": "2025-01-15T10:30:00Z",
+    "updated_at": "2025-01-15T10:30:00Z"
+  }
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- Report not found → RAISE 'REPORT_NOT_FOUND'
+
+---
+
+### 4. sp_mod_update_report_status
+
+**Purpose**: Update report status and add resolution notes
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_update_report_status(
+    p_admin_user_id UUID,
+    p_report_id UUID,
+    p_new_status VARCHAR(20),        -- 'reviewing', 'resolved', 'dismissed'
+    p_resolution_notes TEXT DEFAULT NULL
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has moderation permissions
+2. Validate report_id exists
+3. Validate new_status is one of: 'reviewing', 'resolved', 'dismissed'
+4. Validate current status allows transition:
+   - 'pending' → can go to 'reviewing', 'resolved', 'dismissed'
+   - 'reviewing' → can go to 'resolved', 'dismissed'
+   - 'resolved' → no further changes allowed
+   - 'dismissed' → no further changes allowed
+5. Update report:
+   - SET status = p_new_status
+   - SET reviewed_by_user_id = p_admin_user_id
+   - SET reviewed_at = NOW()
+   - SET resolution_notes = p_resolution_notes
+   - SET updated_at = NOW()
+6. Return updated report details
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "report_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "resolved",
+  "reviewed_by_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "reviewed_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- Report not found → RAISE 'REPORT_NOT_FOUND'
+- Invalid status value → RAISE 'INVALID_STATUS'
+- Invalid status transition → RAISE 'INVALID_STATUS_TRANSITION'
+
+---
+
+### 5. sp_mod_moderate_main_photo
+
+**Purpose**: Approve or reject a user's main profile photo
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_moderate_main_photo(
+    p_admin_user_id UUID,
+    p_user_id UUID,
+    p_moderation_status VARCHAR(20),  -- 'approved' or 'rejected'
+    p_rejection_reason TEXT DEFAULT NULL
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has photo moderation permissions
+2. Validate user_id exists
+3. Validate moderation_status is 'approved' or 'rejected'
+4. Check user has main_photo_url set
+5. Update activity.users:
+   - SET main_photo_moderation_status = p_moderation_status
+   - SET updated_at = NOW()
+6. If rejected and p_rejection_reason provided:
+   - Store rejection reason in payload JSONB: {"photo_rejection_reason": "..."}
+   - Send email notification via email-api (async call from API layer)
+7. Return moderation result
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "main_photo_url": "https://cdn.example.com/photos/user123.jpg",
+  "moderation_status": "approved",
+  "moderated_at": "2025-01-15T14:30:00Z"
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- User not found → RAISE 'USER_NOT_FOUND'
+- No main photo set → RAISE 'NO_MAIN_PHOTO'
+- Invalid moderation_status → RAISE 'INVALID_MODERATION_STATUS'
+
+---
+
+### 6. sp_mod_get_pending_photos
+
+**Purpose**: Get list of users with pending main photo moderation
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_get_pending_photos(
+    p_admin_user_id UUID,
+    p_limit INT DEFAULT 50,
+    p_offset INT DEFAULT 0
+) RETURNS TABLE (
+    user_id UUID,
+    username VARCHAR(100),
+    email VARCHAR(255),
+    main_photo_url VARCHAR(500),
+    created_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE
+)
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has photo moderation permissions
+2. SELECT from activity.users WHERE:
+   - main_photo_moderation_status = 'pending'
+   - main_photo_url IS NOT NULL
+3. ORDER BY created_at ASC (oldest first - FIFO queue)
+4. Apply LIMIT and OFFSET for pagination
+5. Return table rows
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+
+---
+
+### 7. sp_mod_ban_user
+
+**Purpose**: Ban or temporarily ban a user
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_ban_user(
+    p_admin_user_id UUID,
+    p_user_id UUID,
+    p_ban_type VARCHAR(20),           -- 'permanent' or 'temporary'
+    p_ban_duration_hours INT DEFAULT NULL, -- Required if temporary
+    p_ban_reason TEXT
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has ban permissions
+2. Validate user_id exists and is not already banned
+3. Validate ban_type is 'permanent' or 'temporary'
+4. If temporary:
+   - Validate p_ban_duration_hours is provided and > 0
+   - Calculate ban_expires_at = NOW() + INTERVAL '1 hour' * p_ban_duration_hours
+   - SET status = 'temporary_ban'
+5. If permanent:
+   - SET ban_expires_at = NULL
+   - SET status = 'banned'
+6. Update activity.users:
+   - SET status = (calculated above)
+   - SET ban_expires_at = (calculated above)
+   - SET ban_reason = p_ban_reason
+   - SET updated_at = NOW()
+7. Send ban notification email via email-api (async call from API layer)
+8. Return ban details
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "temporary_ban",
+  "ban_expires_at": "2025-01-22T14:00:00Z",
+  "ban_reason": "Repeated no-shows",
+  "banned_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- User not found → RAISE 'USER_NOT_FOUND'
+- User already banned → RAISE 'USER_ALREADY_BANNED'
+- Invalid ban_type → RAISE 'INVALID_BAN_TYPE'
+- Temporary ban missing duration → RAISE 'DURATION_REQUIRED'
+- Invalid duration value → RAISE 'INVALID_DURATION'
+- Cannot ban yourself → RAISE 'CANNOT_SELF_BAN'
+
+---
+
+### 8. sp_mod_unban_user
+
+**Purpose**: Remove ban from a user
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_unban_user(
+    p_admin_user_id UUID,
+    p_user_id UUID,
+    p_unban_reason TEXT
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has unban permissions
+2. Validate user_id exists
+3. Check user is currently banned (status IN ('temporary_ban', 'banned'))
+4. Update activity.users:
+   - SET status = 'active'
+   - SET ban_expires_at = NULL
+   - SET ban_reason = NULL (clear old reason)
+   - SET updated_at = NOW()
+5. Store unban reason in payload JSONB: {"unban_reason": "...", "unbanned_at": "...", "unbanned_by": "..."}
+6. Send unban notification email via email-api (async call from API layer)
+7. Return unban details
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "active",
+  "unbanned_at": "2025-01-18T10:00:00Z",
+  "unbanned_by_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- User not found → RAISE 'USER_NOT_FOUND'
+- User not banned → RAISE 'USER_NOT_BANNED'
+
+---
+
+### 9. sp_mod_remove_content
+
+**Purpose**: Remove or hide problematic content (posts, comments)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_remove_content(
+    p_admin_user_id UUID,
+    p_content_type VARCHAR(50),      -- 'post' or 'comment'
+    p_content_id UUID,
+    p_removal_reason TEXT
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has content removal permissions
+2. Validate content_type is 'post' or 'comment'
+3. Based on content_type:
+   - **'post'**: 
+     - Check post exists in activity.posts
+     - UPDATE activity.posts SET status = 'removed' WHERE post_id = p_content_id
+     - Store removal reason in payload JSONB
+   - **'comment'**:
+     - Check comment exists in activity.comments
+     - UPDATE activity.comments SET is_deleted = TRUE WHERE comment_id = p_content_id
+     - Store removal reason in payload JSONB
+4. Get author_user_id from post/comment
+5. Send content removal notification email to author (async call from API layer)
+6. Return removal confirmation
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "content_type": "post",
+  "content_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "removed",
+  "removed_at": "2025-01-15T15:00:00Z",
+  "removed_by_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- Invalid content_type → RAISE 'INVALID_CONTENT_TYPE'
+- Content not found → RAISE 'CONTENT_NOT_FOUND'
+- Content already removed → RAISE 'CONTENT_ALREADY_REMOVED'
+
+---
+
+### 10. sp_mod_get_user_moderation_history
+
+**Purpose**: Get complete moderation history for a user (reports, bans, warnings)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_get_user_moderation_history(
+    p_admin_user_id UUID,
+    p_target_user_id UUID
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has history view permissions
+2. Validate target_user_id exists
+3. Collect comprehensive user moderation data:
+   - **User info**: username, email, status, no_show_count, verification_count
+   - **Ban history**: Extract from payload JSONB (all past bans/unbans)
+   - **Reports about this user**: Count and list from activity.reports WHERE reported_user_id
+   - **Reports by this user**: Count and list from activity.reports WHERE reporter_user_id
+   - **Content removals**: Count removed posts/comments by this author
+   - **Photo rejections**: Count from payload JSONB photo rejection history
+4. Return structured JSON with all moderation events sorted by date
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "user": {
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "username": "problem_user",
+    "email": "problem@example.com",
+    "status": "active",
+    "no_show_count": 5,
+    "verification_count": 2,
+    "created_at": "2024-06-01T10:00:00Z"
+  },
+  "moderation_summary": {
+    "total_reports_received": 12,
+    "total_reports_made": 3,
+    "total_bans": 2,
+    "total_content_removed": 4,
+    "total_photo_rejections": 1
+  },
+  "history": [
+    {
+      "event_type": "ban",
+      "event_date": "2025-01-10T10:00:00Z",
+      "ban_type": "temporary",
+      "duration_hours": 168,
+      "reason": "Repeated no-shows",
+      "actioned_by_user_id": "..."
+    },
+    {
+      "event_type": "report",
+      "event_date": "2025-01-05T14:00:00Z",
+      "report_type": "no_show",
+      "reporter_user_id": "...",
+      "status": "resolved"
+    },
+    {
+      "event_type": "content_removal",
+      "event_date": "2024-12-20T09:00:00Z",
+      "content_type": "post",
+      "content_id": "...",
+      "reason": "Spam"
+    }
+  ]
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- User not found → RAISE 'USER_NOT_FOUND'
+
+---
+
+### 11. sp_mod_get_statistics
+
+**Purpose**: Get overall moderation statistics (admin dashboard metrics)
+
+**Signature**:
+```sql
+CREATE OR REPLACE FUNCTION activity.sp_mod_get_statistics(
+    p_admin_user_id UUID,
+    p_date_from TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+    p_date_to TIMESTAMP WITH TIME ZONE DEFAULT NULL
+) RETURNS JSON
+```
+
+**Business Logic**:
+1. Validate admin_user_id exists and has statistics view permissions
+2. Set date range defaults:
+   - p_date_from = p_date_from OR (NOW() - INTERVAL '30 days')
+   - p_date_to = p_date_to OR NOW()
+3. Calculate statistics for date range:
+   - **Reports**: Total, by status, by type
+   - **Users**: Total banned, temp banned, active bans
+   - **Content**: Total removed posts, comments
+   - **Photos**: Total pending, approved, rejected
+   - **Response time**: Avg time from report creation to resolution
+4. Return comprehensive statistics JSON
+
+**Return Format**:
+```json
+{
+  "success": true,
+  "date_range": {
+    "from": "2024-12-15T00:00:00Z",
+    "to": "2025-01-15T00:00:00Z"
+  },
+  "reports": {
+    "total": 156,
+    "pending": 23,
+    "reviewing": 8,
+    "resolved": 115,
+    "dismissed": 10,
+    "by_type": {
+      "spam": 45,
+      "harassment": 32,
+      "inappropriate": 28,
+      "no_show": 41,
+      "fake": 7,
+      "other": 3
+    },
+    "avg_resolution_time_hours": 18.5
+  },
+  "users": {
+    "total_banned": 12,
+    "permanent_bans": 3,
+    "temporary_bans": 9,
+    "unbanned": 5
+  },
+  "content": {
+    "posts_removed": 28,
+    "comments_removed": 67
+  },
+  "photos": {
+    "pending_moderation": 15,
+    "approved": 245,
+    "rejected": 8
+  }
+}
+```
+
+**Error Cases**:
+- Admin user not found → RAISE 'ADMIN_NOT_FOUND'
+- Admin lacks permissions → RAISE 'INSUFFICIENT_PERMISSIONS'
+- Invalid date range → RAISE 'INVALID_DATE_RANGE'
+
+---
+
+## API ENDPOINTS SPECIFICATIONS
+
+### Base URL
+```
+http://localhost:8000/moderation
+```
+
+### Authentication
+All endpoints require JWT Bearer token in Authorization header:
+```
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+Extract `user_id` from JWT token payload (`sub` claim).
+
+### Admin Role Validation
+Admin endpoints require role check. Two approaches:
+
+**Option A**: JWT contains `roles` claim (recommended)
+```json
+{
+  "sub": "user-uuid",
+  "roles": ["admin", "moderator"],
+  "exp": 1234567890
+}
+```
+Check if `"admin"` or `"moderator"` in token roles.
+
+**Option B**: Database lookup via stored procedure
+```sql
+-- Add to each admin SP:
+IF NOT EXISTS (
+    SELECT 1 FROM activity.organization_members 
+    WHERE user_id = p_admin_user_id 
+    AND role IN ('owner', 'admin', 'moderator')
+) THEN
+    RAISE EXCEPTION 'INSUFFICIENT_PERMISSIONS';
+END IF;
+```
+
+**Implementation**: Use Option A (JWT roles) for performance. Auth-api already supports this.
+
+---
+
+### ENDPOINT 1: Create Report
+
+**POST /moderation/reports**
+
+**Description**: User reports problematic content or behavior
+
+**Authentication**: Required (regular user token)
+
+**Rate Limit**: 10 requests per minute per user
+
+**Request Body**:
+```json
+{
+  "target_type": "post",
+  "target_id": "550e8400-e29b-41d4-a716-446655440000",
+  "report_type": "spam",
+  "description": "This post contains spam links and promotional content"
+}
+```
+
+**Validation Rules**:
+- `target_type`: Required, must be one of ['user', 'post', 'comment', 'activity', 'community']
+- `target_id`: Required, valid UUID format
+- `report_type`: Required, must be one of ['spam', 'harassment', 'inappropriate', 'fake', 'no_show', 'other']
+- `description`: Optional, max 2000 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_create_report($1, $2, $3, $4, $5, $6)",
+    user_id,           # From JWT token
+    None,              # reported_user_id (SP determines this)
+    target_type,
+    target_id,
+    report_type,
+    description
+)
+```
+
+**Success Response (201 Created)**:
+```json
+{
+  "success": true,
+  "report_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "created_at": "2025-01-15T10:30:00Z"
+}
+```
+
+**Error Responses**:
+
+400 Bad Request:
+```json
+{
+  "detail": "INVALID_TARGET_TYPE: target_type must be one of: user, post, comment, activity, community"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "TARGET_NOT_FOUND: The specified target does not exist"
+}
+```
+
+409 Conflict:
+```json
+{
+  "detail": "DUPLICATE_REPORT: You have already reported this target within the last 24 hours"
+}
+```
+
+422 Unprocessable Entity (Pydantic validation):
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "target_id"],
+      "msg": "value is not a valid uuid",
+      "type": "type_error.uuid"
+    }
+  ]
+}
+```
+
+---
+
+### ENDPOINT 2: Get Reports (Admin)
+
+**GET /moderation/reports**
+
+**Description**: Retrieve reports with filtering (admin moderation queue)
+
+**Authentication**: Required (admin/moderator token)
+
+**Query Parameters**:
+- `status` (optional): Filter by status ['pending', 'reviewing', 'resolved', 'dismissed']
+- `target_type` (optional): Filter by target type ['user', 'post', 'comment', 'activity', 'community']
+- `report_type` (optional): Filter by report type ['spam', 'harassment', 'inappropriate', 'fake', 'no_show', 'other']
+- `limit` (optional): Results per page (default: 50, max: 100)
+- `offset` (optional): Pagination offset (default: 0)
+
+**Example Request**:
+```
+GET /moderation/reports?status=pending&limit=20&offset=0
+```
+
+**Stored Procedure Call**:
+```python
+reports = await db.fetch_all(
+    """
+    SELECT * FROM activity.sp_mod_get_reports($1, $2, $3, $4, $5, $6)
+    """,
+    admin_user_id,    # From JWT token
+    status,           # Query param or None
+    target_type,      # Query param or None
+    report_type,      # Query param or None
+    limit,
+    offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "reports": [
+    {
+      "report_id": "550e8400-e29b-41d4-a716-446655440000",
+      "reporter": {
+        "user_id": "...",
+        "username": "john_doe",
+        "email": "john@example.com"
+      },
+      "reported_user": {
+        "user_id": "...",
+        "username": "bad_actor",
+        "email": "bad@example.com"
+      },
+      "target_type": "post",
+      "target_id": "...",
+      "report_type": "spam",
+      "description": "Spam content",
+      "status": "pending",
+      "created_at": "2025-01-15T10:30:00Z",
+      "updated_at": "2025-01-15T10:30:00Z"
+    }
+  ],
+  "pagination": {
+    "limit": 20,
+    "offset": 0,
+    "total": 156
+  }
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "INVALID_STATUS: status must be one of: pending, reviewing, resolved, dismissed"
+}
+```
+
+---
+
+### ENDPOINT 3: Get Single Report (Admin)
+
+**GET /moderation/reports/{report_id}**
+
+**Description**: Get detailed information for a specific report
+
+**Authentication**: Required (admin/moderator token)
+
+**Path Parameters**:
+- `report_id`: UUID of the report
+
+**Stored Procedure Call**:
+```python
+report = await db.fetch_one(
+    "SELECT activity.sp_mod_get_report_by_id($1, $2)",
+    admin_user_id,
+    report_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "report": {
+    "report_id": "550e8400-e29b-41d4-a716-446655440000",
+    "reporter": {
+      "user_id": "...",
+      "username": "john_doe",
+      "email": "john@example.com"
+    },
+    "reported_user": {
+      "user_id": "...",
+      "username": "bad_actor",
+      "email": "bad@example.com",
+      "no_show_count": 3,
+      "verification_count": 5
+    },
+    "target": {
+      "type": "post",
+      "id": "...",
+      "content": "Offensive content here...",
+      "author_username": "bad_actor",
+      "created_at": "2025-01-10T15:00:00Z"
+    },
+    "report_type": "harassment",
+    "description": "User is repeatedly harassing members",
+    "status": "pending",
+    "reviewed_by": null,
+    "reviewed_at": null,
+    "resolution_notes": null,
+    "created_at": "2025-01-15T10:30:00Z",
+    "updated_at": "2025-01-15T10:30:00Z"
+  }
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "REPORT_NOT_FOUND: Report with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 4: Update Report Status (Admin)
+
+**PATCH /moderation/reports/{report_id}/status**
+
+**Description**: Update report status and add resolution notes
+
+**Authentication**: Required (admin/moderator token)
+
+**Path Parameters**:
+- `report_id`: UUID of the report
+
+**Request Body**:
+```json
+{
+  "status": "resolved",
+  "resolution_notes": "User has been warned and content removed"
+}
+```
+
+**Validation Rules**:
+- `status`: Required, must be one of ['reviewing', 'resolved', 'dismissed']
+- `resolution_notes`: Optional, max 2000 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_update_report_status($1, $2, $3, $4)",
+    admin_user_id,
+    report_id,
+    status,
+    resolution_notes
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "report_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "resolved",
+  "reviewed_by_user_id": "660e8400-e29b-41d4-a716-446655440000",
+  "reviewed_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "INVALID_STATUS_TRANSITION: Cannot change status from resolved to reviewing"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "REPORT_NOT_FOUND: Report with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 5: Get Pending Photos (Admin)
+
+**GET /moderation/photos/pending**
+
+**Description**: Get list of users with pending main photo moderation
+
+**Authentication**: Required (admin/moderator token)
+
+**Query Parameters**:
+- `limit` (optional): Results per page (default: 50, max: 100)
+- `offset` (optional): Pagination offset (default: 0)
+
+**Stored Procedure Call**:
+```python
+photos = await db.fetch_all(
+    "SELECT * FROM activity.sp_mod_get_pending_photos($1, $2, $3)",
+    admin_user_id,
+    limit,
+    offset
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "pending_photos": [
+    {
+      "user_id": "550e8400-e29b-41d4-a716-446655440000",
+      "username": "john_doe",
+      "email": "john@example.com",
+      "main_photo_url": "https://cdn.example.com/photos/user123.jpg",
+      "created_at": "2025-01-10T10:00:00Z",
+      "updated_at": "2025-01-10T10:00:00Z"
+    }
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "total": 15
+  }
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+---
+
+### ENDPOINT 6: Moderate Main Photo (Admin)
+
+**POST /moderation/photos/moderate**
+
+**Description**: Approve or reject a user's main profile photo
+
+**Authentication**: Required (admin/moderator token)
+
+**Rate Limit**: 100 requests per minute per admin
+
+**Request Body**:
+```json
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "moderation_status": "approved"
+}
+```
+
+OR (for rejection):
+```json
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "moderation_status": "rejected",
+  "rejection_reason": "Photo does not show a clear face"
+}
+```
+
+**Validation Rules**:
+- `user_id`: Required, valid UUID
+- `moderation_status`: Required, must be 'approved' or 'rejected'
+- `rejection_reason`: Required if status='rejected', max 500 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_moderate_main_photo($1, $2, $3, $4)",
+    admin_user_id,
+    user_id,
+    moderation_status,
+    rejection_reason
+)
+```
+
+**Post-Processing (API Layer)**:
+If status = 'rejected' AND rejection_reason provided:
+```python
+# Send email notification via email-api
+await email_api.send_email(
+    to=user_email,
+    template="photo_rejected",
+    context={
+        "username": username,
+        "rejection_reason": rejection_reason
+    }
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "main_photo_url": "https://cdn.example.com/photos/user123.jpg",
+  "moderation_status": "approved",
+  "moderated_at": "2025-01-15T14:30:00Z"
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "NO_MAIN_PHOTO: User has not uploaded a main profile photo"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "USER_NOT_FOUND: User with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 7: Ban User (Admin)
+
+**POST /moderation/users/{user_id}/ban**
+
+**Description**: Ban or temporarily ban a user
+
+**Authentication**: Required (admin/moderator token)
+
+**Path Parameters**:
+- `user_id`: UUID of the user to ban
+
+**Request Body (Permanent Ban)**:
+```json
+{
+  "ban_type": "permanent",
+  "ban_reason": "Repeated violations of community guidelines"
+}
+```
+
+**Request Body (Temporary Ban)**:
+```json
+{
+  "ban_type": "temporary",
+  "ban_duration_hours": 168,
+  "ban_reason": "Repeated no-shows at activities"
+}
+```
+
+**Validation Rules**:
+- `ban_type`: Required, must be 'permanent' or 'temporary'
+- `ban_duration_hours`: Required if ban_type='temporary', must be > 0
+- `ban_reason`: Required, max 1000 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_ban_user($1, $2, $3, $4, $5)",
+    admin_user_id,
+    user_id,
+    ban_type,
+    ban_duration_hours,
+    ban_reason
+)
+```
+
+**Post-Processing (API Layer)**:
+```python
+# Send ban notification email via email-api
+await email_api.send_email(
+    to=user_email,
+    template="user_banned",
+    context={
+        "username": username,
+        "ban_type": ban_type,
+        "ban_expires_at": ban_expires_at if temporary else None,
+        "ban_reason": ban_reason
+    }
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "temporary_ban",
+  "ban_expires_at": "2025-01-22T14:00:00Z",
+  "ban_reason": "Repeated no-shows",
+  "banned_at": "2025-01-15T14:00:00Z"
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin role required for banning users"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "USER_ALREADY_BANNED: User is already banned"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "CANNOT_SELF_BAN: You cannot ban yourself"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "USER_NOT_FOUND: User with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 8: Unban User (Admin)
+
+**POST /moderation/users/{user_id}/unban**
+
+**Description**: Remove ban from a user
+
+**Authentication**: Required (admin/moderator token)
+
+**Path Parameters**:
+- `user_id`: UUID of the user to unban
+
+**Request Body**:
+```json
+{
+  "unban_reason": "User has appealed and shown improved behavior"
+}
+```
+
+**Validation Rules**:
+- `unban_reason`: Required, max 1000 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_unban_user($1, $2, $3)",
+    admin_user_id,
+    user_id,
+    unban_reason
+)
+```
+
+**Post-Processing (API Layer)**:
+```python
+# Send unban notification email via email-api
+await email_api.send_email(
+    to=user_email,
+    template="user_unbanned",
+    context={
+        "username": username,
+        "unban_reason": unban_reason
+    }
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "active",
+  "unbanned_at": "2025-01-18T10:00:00Z",
+  "unbanned_by_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin role required for unbanning users"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "USER_NOT_BANNED: User is not currently banned"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "USER_NOT_FOUND: User with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 9: Remove Content (Admin)
+
+**POST /moderation/content/remove**
+
+**Description**: Remove or hide problematic content (posts, comments)
+
+**Authentication**: Required (admin/moderator token)
+
+**Request Body**:
+```json
+{
+  "content_type": "post",
+  "content_id": "550e8400-e29b-41d4-a716-446655440000",
+  "removal_reason": "Violates community guidelines - spam content"
+}
+```
+
+**Validation Rules**:
+- `content_type`: Required, must be 'post' or 'comment'
+- `content_id`: Required, valid UUID
+- `removal_reason`: Required, max 1000 characters
+
+**Stored Procedure Call**:
+```python
+result = await db.fetch_one(
+    "SELECT activity.sp_mod_remove_content($1, $2, $3, $4)",
+    admin_user_id,
+    content_type,
+    content_id,
+    removal_reason
+)
+```
+
+**Post-Processing (API Layer)**:
+```python
+# Get author details from result
+author_user_id = result['author_user_id']
+author_email = result['author_email']
+
+# Send content removal notification via email-api
+await email_api.send_email(
+    to=author_email,
+    template="content_removed",
+    context={
+        "content_type": content_type,
+        "removal_reason": removal_reason
+    }
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "content_type": "post",
+  "content_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "removed",
+  "removed_at": "2025-01-15T15:00:00Z",
+  "removed_by_user_id": "660e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "CONTENT_ALREADY_REMOVED: This content has already been removed"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "CONTENT_NOT_FOUND: Content with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 10: Get User Moderation History (Admin)
+
+**GET /moderation/users/{user_id}/history**
+
+**Description**: Get complete moderation history for a user
+
+**Authentication**: Required (admin/moderator token)
+
+**Path Parameters**:
+- `user_id`: UUID of the user
+
+**Stored Procedure Call**:
+```python
+history = await db.fetch_one(
+    "SELECT activity.sp_mod_get_user_moderation_history($1, $2)",
+    admin_user_id,
+    user_id
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "user": {
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "username": "problem_user",
+    "email": "problem@example.com",
+    "status": "active",
+    "no_show_count": 5,
+    "verification_count": 2,
+    "created_at": "2024-06-01T10:00:00Z"
+  },
+  "moderation_summary": {
+    "total_reports_received": 12,
+    "total_reports_made": 3,
+    "total_bans": 2,
+    "total_content_removed": 4,
+    "total_photo_rejections": 1
+  },
+  "history": [
+    {
+      "event_type": "ban",
+      "event_date": "2025-01-10T10:00:00Z",
+      "ban_type": "temporary",
+      "duration_hours": 168,
+      "reason": "Repeated no-shows",
+      "actioned_by_user_id": "..."
+    },
+    {
+      "event_type": "report",
+      "event_date": "2025-01-05T14:00:00Z",
+      "report_type": "no_show",
+      "reporter_user_id": "...",
+      "status": "resolved"
+    },
+    {
+      "event_type": "content_removal",
+      "event_date": "2024-12-20T09:00:00Z",
+      "content_type": "post",
+      "content_id": "...",
+      "reason": "Spam"
+    }
+  ]
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+}
+```
+
+404 Not Found:
+```json
+{
+  "detail": "USER_NOT_FOUND: User with specified ID does not exist"
+}
+```
+
+---
+
+### ENDPOINT 11: Get Moderation Statistics (Admin)
+
+**GET /moderation/statistics**
+
+**Description**: Get overall moderation statistics for admin dashboard
+
+**Authentication**: Required (admin/moderator token)
+
+**Query Parameters**:
+- `date_from` (optional): ISO 8601 timestamp (default: 30 days ago)
+- `date_to` (optional): ISO 8601 timestamp (default: now)
+
+**Example Request**:
+```
+GET /moderation/statistics?date_from=2024-12-15T00:00:00Z&date_to=2025-01-15T00:00:00Z
+```
+
+**Stored Procedure Call**:
+```python
+stats = await db.fetch_one(
+    "SELECT activity.sp_mod_get_statistics($1, $2, $3)",
+    admin_user_id,
+    date_from,
+    date_to
+)
+```
+
+**Success Response (200 OK)**:
+```json
+{
+  "success": true,
+  "date_range": {
+    "from": "2024-12-15T00:00:00Z",
+    "to": "2025-01-15T00:00:00Z"
+  },
+  "reports": {
+    "total": 156,
+    "pending": 23,
+    "reviewing": 8,
+    "resolved": 115,
+    "dismissed": 10,
+    "by_type": {
+      "spam": 45,
+      "harassment": 32,
+      "inappropriate": 28,
+      "no_show": 41,
+      "fake": 7,
+      "other": 3
+    },
+    "avg_resolution_time_hours": 18.5
+  },
+  "users": {
+    "total_banned": 12,
+    "permanent_bans": 3,
+    "temporary_bans": 9,
+    "unbanned": 5
+  },
+  "content": {
+    "posts_removed": 28,
+    "comments_removed": 67
+  },
+  "photos": {
+    "pending_moderation": 15,
+    "approved": 245,
+    "rejected": 8
+  }
+}
+```
+
+**Error Responses**:
+
+403 Forbidden:
+```json
+{
+  "detail": "INSUFFICIENT_PERMISSIONS: Admin role required"
+}
+```
+
+400 Bad Request:
+```json
+{
+  "detail": "INVALID_DATE_RANGE: date_from must be before date_to"
+}
+```
+
+---
+
+## ERROR HANDLING & STATUS CODES
+
+### HTTP Status Codes
+- **200 OK**: Successful GET/PATCH request
+- **201 Created**: Successful POST request that creates a resource
+- **400 Bad Request**: Invalid input, business rule violation
+- **401 Unauthorized**: Missing or invalid authentication token
+- **403 Forbidden**: Insufficient permissions
+- **404 Not Found**: Resource does not exist
+- **409 Conflict**: Duplicate resource (e.g., duplicate report)
+- **422 Unprocessable Entity**: Pydantic validation error
+- **429 Too Many Requests**: Rate limit exceeded
+- **500 Internal Server Error**: Unexpected server error
+
+### Error Response Format
+All errors return JSON with `detail` field:
+```json
+{
+  "detail": "ERROR_CODE: Human-readable error message"
+}
+```
+
+### Stored Procedure Error Mapping
+Map PostgreSQL RAISE EXCEPTION messages to HTTP status codes:
+
+```python
+# In API layer exception handler
+def map_sp_error_to_http(error_message: str):
+    error_code = error_message.split(':')[0] if ':' in error_message else error_message
+    
+    mapping = {
+        # 400 Bad Request
+        'INVALID_TARGET_TYPE': 400,
+        'INVALID_REPORT_TYPE': 400,
+        'INVALID_STATUS': 400,
+        'INVALID_MODERATION_STATUS': 400,
+        'INVALID_BAN_TYPE': 400,
+        'INVALID_DURATION': 400,
+        'INVALID_CONTENT_TYPE': 400,
+        'INVALID_STATUS_TRANSITION': 400,
+        'INVALID_DATE_RANGE': 400,
+        'DURATION_REQUIRED': 400,
+        'USER_ALREADY_BANNED': 400,
+        'USER_NOT_BANNED': 400,
+        'CONTENT_ALREADY_REMOVED': 400,
+        'NO_MAIN_PHOTO': 400,
+        'CANNOT_SELF_REPORT': 400,
+        'CANNOT_SELF_BAN': 400,
+        
+        # 403 Forbidden
+        'INSUFFICIENT_PERMISSIONS': 403,
+        'ADMIN_INACTIVE': 403,
+        
+        # 404 Not Found
+        'REPORTER_NOT_FOUND': 404,
+        'ADMIN_NOT_FOUND': 404,
+        'USER_NOT_FOUND': 404,
+        'TARGET_NOT_FOUND': 404,
+        'REPORT_NOT_FOUND': 404,
+        'CONTENT_NOT_FOUND': 404,
+        
+        # 409 Conflict
+        'DUPLICATE_REPORT': 409,
+    }
+    
+    status_code = mapping.get(error_code, 500)
+    return status_code, error_message
+```
+
+### Example Exception Handler
+```python
+from fastapi import HTTPException
+import asyncpg
+
+async def call_stored_procedure(query: str, *args):
+    try:
+        result = await db.fetch_one(query, *args)
+        return result
+    except asyncpg.PostgresError as e:
+        status_code, message = map_sp_error_to_http(str(e))
+        raise HTTPException(status_code=status_code, detail=message)
+    except Exception as e:
+        # Unexpected error
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+```
+
+---
+
+## BUSINESS RULES
+
+### Report Creation Rules
+1. User cannot report themselves
+2. User cannot create duplicate reports for same target within 24 hours
+3. Target must exist before report can be created
+4. For 'no_show' reports on users: Increment reported_user.no_show_count
+5. All reports start with status='pending'
+
+### Photo Moderation Rules
+1. User must have main_photo_url set before moderation
+2. Photo status can be: pending → approved/rejected
+3. Rejected photos require rejection_reason
+4. Send email notification on rejection
+5. Users with rejected photos cannot join activities until approved photo uploaded
+
+### Ban Rules
+1. Admin cannot ban themselves
+2. Cannot ban already banned user (must unban first)
+3. Temporary bans require duration_hours (> 0)
+4. Permanent bans have ban_expires_at = NULL
+5. Send email notification on ban/unban
+6. Banned users cannot:
+   - Create activities
+   - Join activities
+   - Post in communities
+   - Send messages
+
+### Content Removal Rules
+1. Content can only be removed once
+2. Removal stores reason in payload JSONB
+3. Send email notification to content author
+4. Removed posts: Set status='removed'
+5. Removed comments: Set is_deleted=TRUE
+
+### Report Status Transitions
+Valid transitions:
+- pending → reviewing, resolved, dismissed
+- reviewing → resolved, dismissed
+- resolved → FINAL STATE (no changes)
+- dismissed → FINAL STATE (no changes)
+
+### Admin Permissions
+Two tiers:
+1. **Moderator**: Can view reports, moderate photos, update report status, remove content
+2. **Admin**: All moderator permissions + ban/unban users
+
+---
+
+## RATE LIMITING
+
+Use Redis for rate limiting (same pattern as auth-api).
+
+### Rate Limits per Endpoint
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+
+# User endpoints
+@limiter.limit("10/minute")  # Create report
+@limiter.limit("30/minute")  # Get own reports
+
+# Admin endpoints (more generous)
+@limiter.limit("100/minute")  # Get reports queue
+@limiter.limit("100/minute")  # Moderate photos
+@limiter.limit("50/minute")   # Ban/unban users
+@limiter.limit("100/minute")  # Remove content
+```
+
+### Redis Keys
+```
+rate_limit:moderation:create_report:{user_id}
+rate_limit:moderation:admin:{admin_user_id}
+```
+
+---
+
+## TESTING CHECKLIST
+
+### Unit Tests (Stored Procedures)
+- [ ] sp_mod_create_report: Valid report creation
+- [ ] sp_mod_create_report: Reject duplicate within 24h
+- [ ] sp_mod_create_report: Reject self-reporting
+- [ ] sp_mod_create_report: Increment no_show_count for no_show reports
+- [ ] sp_mod_get_reports: Filter by status
+- [ ] sp_mod_get_reports: Filter by target_type
+- [ ] sp_mod_get_reports: Pagination works
+- [ ] sp_mod_get_report_by_id: Include all related entities
+- [ ] sp_mod_update_report_status: Valid status transitions
+- [ ] sp_mod_update_report_status: Reject invalid transitions
+- [ ] sp_mod_moderate_main_photo: Approve photo
+- [ ] sp_mod_moderate_main_photo: Reject photo with reason
+- [ ] sp_mod_get_pending_photos: Return oldest first
+- [ ] sp_mod_ban_user: Permanent ban
+- [ ] sp_mod_ban_user: Temporary ban with expiry
+- [ ] sp_mod_ban_user: Reject self-ban
+- [ ] sp_mod_unban_user: Restore active status
+- [ ] sp_mod_remove_content: Remove post
+- [ ] sp_mod_remove_content: Remove comment
+- [ ] sp_mod_get_user_moderation_history: Complete history
+- [ ] sp_mod_get_statistics: Accurate counts
+
+### Integration Tests (API Endpoints)
+- [ ] POST /moderation/reports: Create valid report
+- [ ] POST /moderation/reports: Rate limit enforcement
+- [ ] GET /moderation/reports: Admin can view queue
+- [ ] GET /moderation/reports: Regular user cannot access (403)
+- [ ] GET /moderation/reports/{id}: Get single report details
+- [ ] PATCH /moderation/reports/{id}/status: Update status
+- [ ] GET /moderation/photos/pending: List pending photos
+- [ ] POST /moderation/photos/moderate: Approve photo
+- [ ] POST /moderation/photos/moderate: Reject photo + send email
+- [ ] POST /moderation/users/{id}/ban: Permanent ban + send email
+- [ ] POST /moderation/users/{id}/ban: Temporary ban + send email
+- [ ] POST /moderation/users/{id}/unban: Restore access + send email
+- [ ] POST /moderation/content/remove: Remove post + notify author
+- [ ] POST /moderation/content/remove: Remove comment + notify author
+- [ ] GET /moderation/users/{id}/history: Complete history
+- [ ] GET /moderation/statistics: Dashboard metrics
+
+### Email Integration Tests
+- [ ] Photo rejection triggers email
+- [ ] Ban triggers email
+- [ ] Unban triggers email
+- [ ] Content removal triggers email
+
+### Permission Tests
+- [ ] Regular user cannot access admin endpoints
+- [ ] Moderator can access moderation endpoints
+- [ ] Admin can access all endpoints
+- [ ] Invalid JWT returns 401
+- [ ] Expired JWT returns 401
+
+---
+
+## IMPLEMENTATION NOTES FOR AI AGENT
+
+### Project Structure
+```
+moderation-api/
+├── app/
+│   ├── main.py                 # FastAPI app initialization
+│   ├── routes/
+│   │   ├── reports.py          # Report endpoints
+│   │   ├── photos.py           # Photo moderation endpoints
+│   │   ├── users.py            # Ban/unban endpoints
+│   │   ├── content.py          # Content removal endpoints
+│   │   └── statistics.py       # Statistics endpoint
+│   ├── models/
+│   │   ├── requests.py         # Pydantic request models
+│   │   └── responses.py        # Pydantic response models
+│   ├── services/
+│   │   ├── database.py         # Database connection pool
+│   │   ├── auth.py             # JWT validation
+│   │   └── email.py            # Email API client
+│   ├── middleware/
+│   │   ├── auth.py             # JWT extraction & validation
+│   │   └── admin.py            # Admin role checking
+│   └── utils/
+│       ├── errors.py           # Error mapping
+│       └── rate_limit.py       # Rate limiting
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```
+
+### Dependencies (requirements.txt)
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+asyncpg==0.29.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+python-jose[cryptography]==3.3.0
+redis==5.0.1
+slowapi==0.1.9
+httpx==0.26.0
+```
+
+### Environment Variables
+```bash
+# Database
+DATABASE_URL=postgresql://user:pass@localhost:5432/activities_db
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
+
+# Auth
+JWT_SECRET_KEY=your-secret-key-from-auth-api
+JWT_ALGORITHM=HS256
+
+# External APIs
+EMAIL_API_URL=http://email-api:8002
+AUTH_API_URL=http://auth-api:8000
+
+# Rate Limiting
+RATE_LIMIT_ENABLED=true
+```
+
+### Database Connection Pattern
+```python
+# app/services/database.py
+import asyncpg
+from asyncpg.pool import Pool
+
+class Database:
+    def __init__(self):
+        self.pool: Pool = None
+    
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(
+            dsn=settings.DATABASE_URL,
+            min_size=5,
+            max_size=20,
+            command_timeout=60
+        )
+    
+    async def disconnect(self):
+        await self.pool.close()
+    
+    async def fetch_one(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
+    
+    async def fetch_all(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+db = Database()
+```
+
+### JWT Validation Pattern
+```python
+# app/middleware/auth.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+
+security = HTTPBearer()
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> dict:
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM]
+        )
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials"
+            )
+        return {
+            "user_id": user_id,
+            "email": payload.get("email"),
+            "roles": payload.get("roles", [])
+        }
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+
+async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    if "admin" not in current_user.get("roles", []) and "moderator" not in current_user.get("roles", []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="INSUFFICIENT_PERMISSIONS: Admin or moderator role required"
+        )
+    return current_user
+```
+
+### Email API Client Pattern
+```python
+# app/services/email.py
+import httpx
+
+class EmailAPIClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.client = httpx.AsyncClient(timeout=30.0)
+    
+    async def send_email(self, to: str, template: str, context: dict):
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/emails/send",
+                json={
+                    "to": to,
+                    "template": template,
+                    "context": context
+                }
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as e:
+            # Log error but don't fail request
+            print(f"Email send failed: {e}")
+
+email_client = EmailAPIClient(settings.EMAIL_API_URL)
+```
+
+### Endpoint Implementation Example
+```python
+# app/routes/reports.py
+from fastapi import APIRouter, Depends, HTTPException
+from app.models.requests import CreateReportRequest
+from app.models.responses import CreateReportResponse
+from app.services.database import db
+from app.middleware.auth import get_current_user
+from slowapi import Limiter
+
+router = APIRouter(prefix="/moderation", tags=["reports"])
+limiter = Limiter(key_func=get_remote_address)
+
+@router.post("/reports", response_model=CreateReportResponse, status_code=201)
+@limiter.limit("10/minute")
+async def create_report(
+    request: CreateReportRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        result = await db.fetch_one(
+            "SELECT activity.sp_mod_create_report($1, $2, $3, $4, $5, $6)",
+            current_user["user_id"],
+            None,
+            request.target_type,
+            request.target_id,
+            request.report_type,
+            request.description
+        )
+        return CreateReportResponse(**dict(result))
+    except asyncpg.PostgresError as e:
+        status_code, message = map_sp_error_to_http(str(e))
+        raise HTTPException(status_code=status_code, detail=message)
+```
+
+---
+
+## SUMMARY
+
+This specification provides:
+1. ✅ Complete stored procedure definitions with business logic
+2. ✅ Full endpoint specifications with request/response formats
+3. ✅ Clear mapping between endpoints and stored procedures
+4. ✅ Comprehensive error handling patterns
+5. ✅ Business rules and constraints
+6. ✅ Rate limiting guidelines
+7. ✅ Testing checklist
+8. ✅ Implementation patterns for AI agents
+
+The AI code agent can now implement the Moderation API with:
+- Zero direct database queries (100% stored procedures)
+- Consistent error handling
+- Proper authentication/authorization
+- Email notifications integration
+- Rate limiting
+- Full test coverage
+
+All specifications are AI-optimized with:
+- Clear parameter mappings
+- Explicit validation rules
+- Structured JSON examples
+- Implementation patterns
+- No ambiguity in business logic
