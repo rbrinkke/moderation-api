@@ -52,12 +52,56 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Moderation API for activities platform",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    version=settings.API_VERSION,
+    description="""Content moderation service for user-generated content and community safety.
+
+Features admin/moderator workflows, automated filtering, photo moderation, and email notifications.
+
+## Key Features
+- Content moderation workflows (pending/approved/rejected)
+- Role-based access (admin/moderator)
+- Photo moderation with reason tracking
+- Email notification integration
+- Stored procedure architecture
+- Rate limiting on moderation actions
+
+## Architecture
+- Database: PostgreSQL with `activity` schema
+- Email: Integration with email-service
+- Auth: JWT Bearer with role validation""",
+    docs_url="/docs" if settings.ENABLE_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_DOCS else None,
+    contact={"name": "Activity Platform Team", "email": "dev@activityapp.com"},
+    license_info={"name": "Proprietary"},
     lifespan=lifespan
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    openapi_schema = get_openapi(
+        title=settings.PROJECT_NAME,
+        version=settings.API_VERSION,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Enter JWT token from auth-api (admin/moderator role required)"
+        }
+    }
+    openapi_schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # Configure rate limiter with Redis storage
 limiter = Limiter(
